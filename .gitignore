@@ -1,0 +1,48 @@
+# Build outputs
+/build/
+/bin/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CMakeFiles/
+CTestTestfile.cmake
+compile_commands.json
+
+# Object / binary files
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.out
+*.exe
+
+# Debug / profiler / coverage artifacts
+*.dSYM/
+*.gcda
+*.gcno
+*.gcov
+*.prof
+*.profraw
+*.profdata
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Local environment files
+.env
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+Thumbs.db

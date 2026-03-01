@@ -5,6 +5,8 @@
 #include <thread>
 #include <functional>
 #include <string>
+#include <mutex>
+#include <queue>
 
 using namespace std;
 
@@ -28,6 +30,11 @@ private:
     redisContext* publish_ctx_;
     redisContext* subscribe_ctx_;
     function<void(int, string)> notify_message_handler_;
+
+    mutex publish_mtx_;
+
+    mutex cmd_queue_mtx_;
+    queue<string> cmd_queue_;
 };
 
 #endif /* REDIS_H */

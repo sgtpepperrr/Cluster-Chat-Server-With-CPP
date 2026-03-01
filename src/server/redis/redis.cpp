@@ -1,6 +1,7 @@
 #include "redis.hpp"
 #include "config.hpp"
 #include <iostream>
+#include <poll.h>
 
 using namespace std;
 
@@ -53,6 +54,8 @@ bool Redis::connect()
 
 bool Redis::publish(int channel, string message)
 {
+    lock_guard<mutex> lock(publish_mtx_);
+
     redisReply* reply = (redisReply*)redisCommand(publish_ctx_, "PUBLISH %d %s", channel, message.c_str());
     if (nullptr == reply)
     {
@@ -65,49 +68,15 @@ bool Redis::publish(int channel, string message)
 
 bool Redis::subscribe(int channel)
 {
-    // SUBSCRIBE命令本身会造成线程阻塞等待通道里面发生消息，这里只做订阅通道，不接收通道消息
-    // 通道消息的接收专门在observe_channel_message函数中的独立线程中进行
-    // 只负责发送命令，不阻塞接收redis server响应消息，否则和notifyMsg线程抢占响应资源
-    if (REDIS_ERR == redisAppendCommand(this->subscribe_ctx_, "SUBSCRIBE %d", channel))
-    {
-        cerr << "subscribe command failed!" << endl;
-        return false;
-    }
-
-    // redisBufferWrite可以循环发送缓冲区，直到缓冲区数据发送完毕（done被置为1）
-    int done = 0;
-    while (!done)
-    {
-        if (REDIS_ERR == redisBufferWrite(this->subscribe_ctx_, &done))
-        {
-            cerr << "subscribe command failed!" << endl;
-            return false;
-        }
-    }
-    // redisGetReply
-
+    lock_guard<mutex> lock(cmd_queue_mtx_);
+    cmd_queue_.push("SUBSCRIBE " + to_string(channel));
     return true;
 }
 
 bool Redis::unsubscribe(int channel)
 {
-    if (REDIS_ERR == redisAppendCommand(this->subscribe_ctx_, "UNSUBSCRIBE %d", channel))
-    {
-        cerr << "unsubscribe command failed!" << endl;
-        return false;
-    }
-
-    // redisBufferWrite可以循环发送缓冲区，直到缓冲区数据发送完毕（done被置为1）
-    int done = 0;
-    while (!done)
-    {
-        if (REDIS_ERR == redisBufferWrite(this->subscribe_ctx_, &done))
-        {
-            cerr << "unsubscribe command failed!" << endl;
-            return false;
-        }
-    }
-
+    lock_guard<mutex> lock(cmd_queue_mtx_);
+    cmd_queue_.push("UNSUBSCRIBE " + to_string(channel));
     return true;
 }
 
@@ -115,16 +84,70 @@ bool Redis::unsubscribe(int channel)
 void Redis::observe_channel_message()
 {
     redisReply* reply = nullptr;
-    while (REDIS_OK == redisGetReply(this->subscribe_ctx_, (void **)&reply))
+
+    while (true)
     {
-        // 订阅收到的消息是一个带三元素的数组
-        if (reply != nullptr && reply->element[2] != nullptr && reply->element[2]->str != nullptr)
+        // 1) 取出队列中的待发命令，通过 subscribe_ctx_ 发送
         {
-            // 给业务层上报通道上发生的消息
-            notify_message_handler_(atoi(reply->element[1]->str) , reply->element[2]->str);
+            lock_guard<mutex> lock(cmd_queue_mtx_);
+            while (!cmd_queue_.empty())
+            {
+                redisAppendCommand(subscribe_ctx_, cmd_queue_.front().c_str());
+                cmd_queue_.pop();
+            }
         }
 
-        freeReplyObject(reply);
+        // 刷出输出缓冲区
+        int done = 0;
+        while (!done)
+        {
+            if (REDIS_ERR == redisBufferWrite(subscribe_ctx_, &done))
+            {
+                cerr << "observe: redisBufferWrite error" << endl;
+                return;
+            }
+        }
+
+        // 2) poll 等待 Redis 推送消息，最多等 200ms
+        struct pollfd pfd;
+        pfd.fd = subscribe_ctx_->fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int ret = poll(&pfd, 1, 200);
+        if (ret < 0)
+        {
+            cerr << "observe: poll error" << endl;
+            return;
+        }
+        if (ret == 0)
+        {
+            continue;  // 超时，回到第 1 步检查队列
+        }
+
+        // 3) 有数据到达，读入内部缓冲区
+        if (REDIS_ERR == redisBufferRead(subscribe_ctx_))
+        {
+            cerr << "observe: redisBufferRead error" << endl;
+            return;
+        }
+
+        // 4) 从缓冲区中解析所有完整的回复
+        while (REDIS_OK == redisGetReplyFromReader(subscribe_ctx_, (void**)&reply))
+        {
+            if (reply == nullptr)
+            {
+                break;  // 没有更多完整回复了
+            }
+
+            // 订阅收到的消息是一个带三元素的数组
+            if (reply != nullptr && reply->element[2] != nullptr && reply->element[2]->str != nullptr)
+            {
+                notify_message_handler_(atoi(reply->element[1]->str), reply->element[2]->str);
+            }
+
+            freeReplyObject(reply);
+        }
     }
 
     cerr << ">>>>>>>>>>>>> observe_channel_message quit <<<<<<<<<<<<<" << endl;

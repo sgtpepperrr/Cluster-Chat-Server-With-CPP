@@ -46,3 +46,10 @@ compile_commands.json
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Benchmark metadata artifacts (machine snapshots)
+bench/runs/**/meta.artifacts/
+
+# Others
+AGENTS.md
+CLAUDE.md

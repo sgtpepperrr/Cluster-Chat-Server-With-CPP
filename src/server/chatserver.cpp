@@ -1,8 +1,8 @@
 #include "chatserver.hpp"
 #include "chatservice.hpp"
 #include "json.hpp"
+#include <muduo/base/Logging.h>
 #include <functional>
-#include <iostream>
 #include <string>
 
 using namespace std;
@@ -46,9 +46,32 @@ void ChatServer::onMessage(const TcpConnectionPtr& conn,
                Timestamp time)  // 接收到数据的时间信息
 {
     string buf = buffer->retrieveAllAsString();
-    json js = json::parse(buf);
 
-    auto msgHandler = ChatService::instance()->getHandler(js["msgId"].get<int>());
-    msgHandler(conn, js, time);
+    // 按 \0 分割处理每条消息（处理 TCP 粘包）
+    size_t start = 0;
+    while (start < buf.size())
+    {
+        size_t end = buf.find('\0', start);
+        if (end == string::npos)
+        {
+            end = buf.size();
+        }
+
+        if (end > start)
+        {
+            try
+            {
+                json js = json::parse(buf.begin() + start, buf.begin() + end);
+                auto msgHandler = ChatService::instance()->getHandler(js["msgId"].get<int>());
+                msgHandler(conn, js, time);
+            }
+            catch (const json::exception& e)
+            {
+                LOG_ERROR << "onMessage parse error: " << e.what();
+            }
+        }
+
+        start = end + 1;
+    }
 }
 

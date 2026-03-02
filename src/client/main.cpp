@@ -284,40 +284,113 @@ void doRegResponse(json& respJs)
     }
 }
 
+// 查找第一个完整 JSON 对象的结束位置
+// 返回结束位置（闭合 } 的下一个字符），未找到返回 string::npos
+static size_t findJsonEnd(const string& buf, size_t start)
+{
+    int depth = 0;
+    bool inStr = false;
+    bool esc = false;
+
+    for (size_t i = start; i < buf.size(); ++i)
+    {
+        char c = buf[i];
+
+        if (esc)
+        {
+            esc = false;
+            continue;
+        }
+        if (inStr)
+        {
+            if (c == '\\') esc = true;
+            else if (c == '"') inStr = false;
+            continue;
+        }
+
+        if (c == '"') { inStr = true; continue; }
+        if (c == '{') ++depth;
+        else if (c == '}')
+        {
+            if (--depth == 0) return i + 1;
+        }
+    }
+
+    return string::npos;  // 不完整，还需要更多数据
+}
+
 void readTaskHandler(int clientfd)
 {
+    string recvBuf;
+    char tmpBuf[4096];
+
     for (;;)
     {
-        char buffer[1024] = { 0 };
-        int len = recv(clientfd, buffer, 1024, 0);
-        if (-1 == len || 0 == len)
+        int len = recv(clientfd, tmpBuf, sizeof(tmpBuf), 0);
+        if (len <= 0)
         {
             close(clientfd);
             exit(-1);
         }
 
-        json js = json::parse(buffer);
-        int msgType = js["msgId"].get<int>();
-        if (ONE_CHAT_MSG == msgType)
+        recvBuf.append(tmpBuf, len);
+
+        // 从缓冲区中提取并处理所有完整的 JSON 消息
+        size_t pos = 0;
+        while (pos < recvBuf.size())
         {
-            cout << js["time"].get<string>() << " [" << js["id"] << "] " << js["name"].get<string>()
-                 << " said: " << js["msg"].get<string>() << endl;
+            // 跳过空白和 \0
+            while (pos < recvBuf.size() &&
+                   (recvBuf[pos] == '\0' || recvBuf[pos] == ' ' ||
+                    recvBuf[pos] == '\n' || recvBuf[pos] == '\r' ||
+                    recvBuf[pos] == '\t'))
+            {
+                ++pos;
+            }
+            if (pos >= recvBuf.size()) break;
+
+            size_t end = findJsonEnd(recvBuf, pos);
+            if (end == string::npos) break;  // 不完整，等下次 recv
+
+            try
+            {
+                json js = json::parse(recvBuf.begin() + pos, recvBuf.begin() + end);
+                int msgType = js["msgId"].get<int>();
+
+                if (ONE_CHAT_MSG == msgType)
+                {
+                    cout << js["time"].get<string>() << " [" << js["id"] << "] " << js["name"].get<string>()
+                         << " said: " << js["msg"].get<string>() << endl;
+                }
+                else if (GROUP_CHAT_MSG == msgType)
+                {
+                    cout << "Group[" << js["groupid"] << "] message: "
+                        << js["time"].get<string>() << " [" << js["id"] << "] " << js["name"].get<string>()
+                         << " said: " << js["msg"].get<string>() << endl;
+                }
+                else if (LOGIN_MSG_ACK == msgType)
+                {
+                    doLoginResponse(js);
+                    sem_post(&rwSem);
+                }
+                else if (REG_MSG_ACK == msgType)
+                {
+                    doRegResponse(js);
+                    sem_post(&rwSem);
+                }
+            }
+            catch (const json::exception& e)
+            {
+                cerr << "JSON parse error: " << e.what() << endl;
+            }
+
+            pos = end;
         }
-        else if (GROUP_CHAT_MSG == msgType)
+
+        // 移除已处理的数据，保留不完整的尾部
+        if (pos > 0)
         {
-            cout << "Group[" << js["groupid"] << "] message: "
-                << js["time"].get<string>() << " [" << js["id"] << "] " << js["name"].get<string>()
-                 << " said: " << js["msg"].get<string>() << endl;
-        }
-        else if (LOGIN_MSG_ACK == msgType)
-        {
-            doLoginResponse(js);
-            sem_post(&rwSem);
-        }
-        else if (REG_MSG_ACK == msgType)
-        {
-            doRegResponse(js);
-            sem_post(&rwSem);
+            recvBuf.erase(0, pos);
         }
     }
 }

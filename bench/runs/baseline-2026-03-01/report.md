@@ -52,3 +52,8 @@ free(): invalid pointer
 - Current bottlenecks:
 - Current stability risks:
 - Priority fixes before next benchmark:
+1. 保证Redis 线程安全
+publish_ctx_和subscribe_ctx_都有可能被多线程访问，目前都没有加保护。
+2. onMessage 异常处理 + 粘包处理
+收到的消息可能存在TCP粘包的问题，之前接收方没有\0作为数据边界，发送方却用了，导致并发量大的时候可能会有这个问题。
+用 \0 分割 buffer 中可能存在的多条消息，每条单独 json::parse，外套 try-catch。这样既处理了粘包问题，也防止解析异常崩溃。

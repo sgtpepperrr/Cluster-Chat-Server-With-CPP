@@ -107,11 +107,14 @@ python3 bench/run.py login --port 8000 --start-id 100 --count 200
 | `--messages` | `100` | chat/group 场景下每个 sender 发送的消息数 |
 | `--group-id` | — | group/all 场景必填，测试群的 ID |
 | `--group-members` | `21` | 测试群的成员数（含 sender） |
-| `--interval` | `0.001` | 每个 sender 两次发送之间的间隔（秒） |
+| `--interval` | `0.001` | chat/group 场景下，每个 sender 两次发送之间的间隔（秒） |
+| `--login-timeout` | `15` | login 响应等待超时（秒） |
 
 ### 关于 `--interval`
 
 默认 1ms（即每个 sender 最高 1000 msg/s）。
+
+`--interval` 不作用于 `login` 场景；`login` 场景通过并发连接数量（`--count`）和 `--login-timeout` 控制压测行为。
 
 服务端 `onMessage` 的实现是 `buffer->retrieveAllAsString()` 取全部数据后调用 `json::parse()`，一次只能解析一条 JSON 消息。如果两条消息在 TCP 层粘包合并到同一次读取中，服务端会解析失败。1ms 间隔在正常负载下足够避免此问题。
 

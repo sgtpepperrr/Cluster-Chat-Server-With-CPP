@@ -23,7 +23,7 @@ Reset before each run
 
 Examples
 --------
-  python3 bench/run.py login --port 8000 --start-id 100 --count 100
+  python3 bench/run.py login --port 8000 --start-id 100 --count 100 --login-timeout 20
   python3 bench/run.py chat  --port 8000 --start-id 100 --count 100 --messages 200
   python3 bench/run.py group --port 8000 --start-id 100 --group-id 5 --messages 200
   python3 bench/run.py all   --port 8000 --start-id 100 --count 200 --group-id 5
@@ -184,6 +184,13 @@ class BenchResult:
         print(f"  Errors:           {self.errors}")
         print(f"  Disconnects:      {self.disconnects}")
         print(f"  Error rate:       {self.error_rate_pct:.1f}%")
+        if "login_errors" in self.extra and self.extra["login_errors"]:
+            print("  --- Login errors ---")
+            for reason, cnt in sorted(
+                self.extra["login_errors"].items(),
+                key=lambda x: (-x[1], x[0]),
+            ):
+                print(f"  {reason:<18} {cnt}")
         if "fanout" in self.extra:
             fo = self.extra["fanout"]
             nr = fo["receivers"]
@@ -200,43 +207,86 @@ class BenchResult:
 # --------------------------------------------------------------------------- #
 # Scenario 1 — Login throughput
 # --------------------------------------------------------------------------- #
-async def _login_one(host: str, port: int, uid: int, pwd: str) -> dict:
+async def _login_one(
+    host: str, port: int, uid: int, pwd: str, login_timeout: float,
+) -> dict:
     conn = ChatConnection(host, port)
     try:
         await conn.connect()
         t0 = time.monotonic()
         await conn.send({"msgId": LOGIN_MSG, "id": uid, "password": pwd})
-        resp = await conn.recv()
+        resp = await conn.recv(timeout=login_timeout)
         t1 = time.monotonic()
-        ok = resp.get("errno") == 0
+        errno = resp.get("errno")
+        ok = errno == 0
+        if not ok:
+            reason = "server_reject"
+            if errno is None:
+                reason = "bad_login_ack"
+            elif errno == 1:
+                reason = "invalid_credentials"
+            elif errno == 2:
+                reason = "already_online"
+            elif errno is not None:
+                reason = f"server_errno_{errno}"
+            return {
+                "lat": (t1 - t0) * 1000,
+                "ok": False,
+                "err": resp.get("errmsg"),
+                "reason": reason,
+            }
         if ok:
             await conn.send({"msgId": LOGOUT_MSG, "id": uid})
             await asyncio.sleep(0.02)
-        return {"lat": (t1 - t0) * 1000, "ok": ok, "err": None}
+        return {"lat": (t1 - t0) * 1000, "ok": True, "err": None, "reason": "ok"}
+    except TimeoutError as exc:
+        return {"lat": None, "ok": False, "err": str(exc), "reason": "recv_timeout"}
+    except ConnectionError as exc:
+        return {"lat": None, "ok": False, "err": str(exc), "reason": "connection_error"}
+    except OSError as exc:
+        msg = str(exc).lower()
+        reason = "os_error"
+        if (
+            "connect" in msg or
+            "connection" in msg or
+            "refused" in msg or
+            "attempt" in msg or
+            "broken pipe" in msg
+        ):
+            reason = "connect_error"
+        return {"lat": None, "ok": False, "err": str(exc), "reason": reason}
     except Exception as exc:
-        return {"lat": None, "ok": False, "err": str(exc)}
+        return {"lat": None, "ok": False, "err": str(exc), "reason": "exception"}
     finally:
         await conn.close()
 
 
-async def bench_login(host: str, port: int, uids: list[int], pwd: str) -> BenchResult:
+async def bench_login(
+    host: str, port: int, uids: list[int], pwd: str, login_timeout: float,
+) -> BenchResult:
     n = len(uids)
-    print(f"[login] {n} concurrent logins ...")
+    print(f"[login] {n} concurrent logins (timeout {login_timeout:.1f}s) ...")
     t0 = time.monotonic()
-    results = await asyncio.gather(*[_login_one(host, port, u, pwd) for u in uids])
+    results = await asyncio.gather(
+        *[_login_one(host, port, u, pwd, login_timeout) for u in uids],
+    )
     dur = time.monotonic() - t0
 
     res = BenchResult("Login Throughput", n, n, dur)
+    login_errors: dict[str, int] = {}
     for r in results:
         if r["ok"]:
             res.successes += 1
             res.latencies_ms.append(r["lat"])
         else:
             res.errors += 1
-            if r["err"] and "connect" in (r["err"] or "").lower():
+            reason = r.get("reason", "unknown")
+            login_errors[reason] = login_errors.get(reason, 0) + 1
+            if reason in ("connection_error", "connect_error"):
                 res.disconnects += 1
             if r["lat"] is not None:
                 res.latencies_ms.append(r["lat"])
+    res.extra["login_errors"] = login_errors
     return res
 
 
@@ -487,6 +537,7 @@ def print_config(args: argparse.Namespace) -> None:
           f"{args.start_id + args.count - 1}  ({args.count} users)")
     print(f"  Messages/sender:  {args.messages}")
     print(f"  Send interval:    {args.interval * 1000:.1f} ms")
+    print(f"  Login timeout:    {args.login_timeout:.1f} s")
     if args.group_id:
         print(f"  Group ID:         {args.group_id}  "
               f"({args.group_members} members)")
@@ -554,6 +605,22 @@ def _results_table(results: list[BenchResult]) -> str:
     return "\n".join(lines)
 
 
+def _login_error_breakdown(results: list[BenchResult]) -> str:
+    lines: list[str] = []
+    for r in results:
+        login_errors = r.extra.get("login_errors", {})
+        if not login_errors:
+            continue
+        lines.append(f"### {r.scenario}")
+        for reason, cnt in sorted(
+            login_errors.items(),
+            key=lambda x: (-x[1], x[0]),
+        ):
+            lines.append(f"- `{reason}`: {cnt}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def write_markdown_report(
     args: argparse.Namespace,
     results: list[BenchResult],
@@ -571,6 +638,14 @@ def write_markdown_report(
         f"{args.group_id} ({args.group_members} members)"
         if args.group_id else "N/A"
     )
+    login_error_block = _login_error_breakdown(results)
+    login_error_section = ""
+    if login_error_block:
+        login_error_section = (
+            "\n## 3.1 Login Error Breakdown\n"
+            + login_error_block
+            + "\n"
+        )
     content = f"""# Benchmark Report
 
 ## 1. Run Snapshot
@@ -586,10 +661,12 @@ def write_markdown_report(
 - User IDs: `{args.start_id}..{user_end}` (`{args.count}` users)
 - Messages per sender: `{args.messages}`
 - Send interval: `{args.interval * 1000:.1f} ms`
+- Login timeout: `{args.login_timeout:.1f} s`
 - Group ID: `{group_text}`
 
 ## 3. Results
 {_results_table(results)}
+{login_error_section}
 
 ## 4. Environment Metadata
 - Metadata file: `{meta_file}`
@@ -640,6 +717,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="number of users in the bench group (default 21)")
     p.add_argument("--interval", type=float, default=0.001,
                    help="seconds between sends per sender (default 0.001)")
+    p.add_argument("--login-timeout", type=float, default=15.0,
+                   help="seconds to wait for login response (default 15)")
     p.add_argument("--run-dir", default="",
                    help="directory for generated report/meta paths")
     p.add_argument("--report-file", default="",
@@ -657,6 +736,9 @@ def main() -> None:
         print("error: --group-id is required for group / all scenario",
               file=sys.stderr)
         sys.exit(1)
+    if args.login_timeout <= 0:
+        print("error: --login-timeout must be > 0", file=sys.stderr)
+        sys.exit(1)
 
     print_config(args)
 
@@ -665,7 +747,11 @@ def main() -> None:
 
     # --- login ---
     if args.scenario in ("login", "all"):
-        r = asyncio.run(bench_login(args.host, args.port, uids, args.password))
+        r = asyncio.run(
+            bench_login(
+                args.host, args.port, uids, args.password, args.login_timeout,
+            ),
+        )
         r.print_report()
         results.append(r)
         if args.scenario == "all":

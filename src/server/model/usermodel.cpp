@@ -1,5 +1,5 @@
 #include "usermodel.hpp"
-#include "db.h"
+#include "connectionpool.h"
 #include <iostream>
 
 using namespace std;
@@ -10,14 +10,11 @@ bool UserModel::insert(User& user)
     snprintf(sql, sizeof(sql), "insert into user(name, password, state) values('%s', '%s', '%s')",
              user.getName().c_str(), user.getPwd().c_str(), user.getState().c_str());
 
-    MySQL mysql;
-    if (mysql.connect())
+    auto conn = ConnectionPool::instance()->getConnection();
+    if (conn->update(sql))
     {
-        if (mysql.update(sql))
-        {
-            user.setId(mysql_insert_id(mysql.getConnection()));
-            return true;
-        }
+        user.setId(mysql_insert_id(conn->getConnection()));
+        return true;
     }
 
     return false;
@@ -28,25 +25,22 @@ User UserModel::query(int id)
     char sql[1024] = { 0 };
     snprintf(sql, sizeof(sql), "select * from user where id = %d", id);
 
-    MySQL mysql;
-    if (mysql.connect())
+    auto conn = ConnectionPool::instance()->getConnection();
+    MYSQL_RES* res = conn->query(sql);
+    if (res != nullptr)
     {
-        MYSQL_RES* res = mysql.query(sql);
-        if (res != nullptr)
+        MYSQL_ROW row = mysql_fetch_row(res);
+        if (row != nullptr)
         {
-            MYSQL_ROW row = mysql_fetch_row(res);
-            if (row != nullptr)
-            {
-                User user;
-                user.setId(atoi(row[0]));
-                user.setName(row[1]);
-                user.setPwd(row[2]);
-                user.setState(row[3]);
+            User user;
+            user.setId(atoi(row[0]));
+            user.setName(row[1]);
+            user.setPwd(row[2]);
+            user.setState(row[3]);
 
-                mysql_free_result(res);
+            mysql_free_result(res);
 
-                return user;
-            }
+            return user;
         }
     }
 
@@ -59,25 +53,14 @@ bool UserModel::updateState(User user)
     snprintf(sql, sizeof(sql), "update user set state = '%s' where id = '%d'",
              user.getState().c_str(), user.getId());
 
-    MySQL mysql;
-    if (mysql.connect())
-    {
-        if (mysql.update(sql))
-        {
-            return true;
-        }
-    }
-
-    return false;
+    auto conn = ConnectionPool::instance()->getConnection();
+    return conn->update(sql);
 }
 
 void UserModel::resetState()
 {
     char sql[1024] = "update user set state = 'offline' where state = 'online'";
 
-    MySQL mysql;
-    if (mysql.connect())
-    {
-        mysql.update(sql);
-    }
+    auto conn = ConnectionPool::instance()->getConnection();
+    conn->update(sql);
 }

@@ -228,17 +228,22 @@ void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time
 {
     int toId = js["to"].get<int>();
     string msg = js.dump();
+    TcpConnectionPtr targetConn;
 
     {
         lock_guard<mutex> lock(connMutex_);
-
         auto it = userConnMap_.find(toId);
         if (it != userConnMap_.end())
         {
-            // toId在线且位于当前服务器，转发消息
-            it->second->send(msg);
-            return;
+            targetConn = it->second;
         }
+    }
+
+    if (targetConn)
+    {
+        // toId在线且位于当前服务器，转发消息
+        targetConn->send(msg);
+        return;
     }
 
     // 尝试通过Redis投递到其它节点。若无订阅者（或发布失败）则转离线消息。

@@ -53,6 +53,8 @@ python3 bench/run.py all --port 8000 --interval 1 --start-id 1 --count 170 --gro
 
 Additional stability validation was executed manually after the 6 saved cases:
 
+- Detailed record: `round1-regression-after-optimization.md`
+
 - `chat --count 750 --messages 200 --interval 0.001` repeated 5 times: all 5 runs `0 error`
 - `chat --count 750 --messages 200 --interval 0.002` repeated 5 times: all 5 runs `0 error`
 

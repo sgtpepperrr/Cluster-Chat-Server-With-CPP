@@ -47,6 +47,42 @@ User UserModel::query(int id)
     return User();
 }
 
+unordered_map<int, string> UserModel::queryStates(const vector<int>& ids)
+{
+    unordered_map<int, string> states;
+    if (ids.empty())
+    {
+        return states;
+    }
+
+    string sql = "select id, state from user where id in(";
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        sql += to_string(ids[i]);
+        if (i + 1 < ids.size())
+        {
+            sql += ",";
+        }
+    }
+    sql += ")";
+
+    auto conn = ConnectionPool::instance()->getConnection();
+    MYSQL_RES* res = conn->query(sql);
+    if (res != nullptr)
+    {
+        MYSQL_ROW row = mysql_fetch_row(res);
+        while (row != nullptr)
+        {
+            states[atoi(row[0])] = row[1];
+            row = mysql_fetch_row(res);
+        }
+
+        mysql_free_result(res);
+    }
+
+    return states;
+}
+
 bool UserModel::updateState(User user)
 {
     char sql[1024] = { 0 };

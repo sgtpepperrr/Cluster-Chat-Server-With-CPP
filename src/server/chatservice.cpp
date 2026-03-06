@@ -291,29 +291,54 @@ void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp ti
     int userid = js["id"].get<int>();
     int groupid = js["groupid"].get<int>();
     vector<int> userIdVec = groupModel_.queryGroupUsers(userid, groupid);
-
-    lock_guard<mutex> lock(connMutex_);
-    for (int id : userIdVec)
+    if (userIdVec.empty())
     {
-        auto it = userConnMap_.find(id);
-        if (it != userConnMap_.end())
+        return;
+    }
+
+    string msg = js.dump();
+    vector<TcpConnectionPtr> localConns;
+    vector<int> otherNodeOrOfflineIds;
+    localConns.reserve(userIdVec.size());
+    otherNodeOrOfflineIds.reserve(userIdVec.size());
+
+    {
+        lock_guard<mutex> lock(connMutex_);
+        for (int id : userIdVec)
         {
-            // 转发群消息
-            it->second->send(js.dump());
-        }
-        else
-        {
-            // id不在当前服务器，查询是否在其它服务器登录了
-            User user = userModel_.query(id);
-            if (user.getState() == "online")
+            auto it = userConnMap_.find(id);
+            if (it != userConnMap_.end())
             {
-                redis_.publish(id, js.dump());
+                localConns.push_back(it->second);
             }
             else
             {
-                // 存储离线消息
-                offlineMsgModel_.insert(id, js.dump());
+                otherNodeOrOfflineIds.push_back(id);
             }
+        }
+    }
+
+    for (const auto& userConn : localConns)
+    {
+        userConn->send(msg);
+    }
+
+    if (otherNodeOrOfflineIds.empty())
+    {
+        return;
+    }
+
+    unordered_map<int, string> stateMap = userModel_.queryStates(otherNodeOrOfflineIds);
+    for (int id : otherNodeOrOfflineIds)
+    {
+        auto it = stateMap.find(id);
+        if (it != stateMap.end() && it->second == "online")
+        {
+            redis_.publish(id, msg);
+        }
+        else
+        {
+            offlineMsgModel_.insert(id, msg);
         }
     }
 }
@@ -321,11 +346,19 @@ void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp ti
 // 从redis消息队列中获取订阅的消息
 void ChatService::handleRedisSubscribeMessage(int userid, string msg)
 {
-    lock_guard<mutex> lock(connMutex_);
-    auto it = userConnMap_.find(userid);
-    if (it != userConnMap_.end())
+    TcpConnectionPtr conn;
     {
-        it->second->send(msg);
+        lock_guard<mutex> lock(connMutex_);
+        auto it = userConnMap_.find(userid);
+        if (it != userConnMap_.end())
+        {
+            conn = it->second;
+        }
+    }
+
+    if (conn)
+    {
+        conn->send(msg);
         return;
     }
 

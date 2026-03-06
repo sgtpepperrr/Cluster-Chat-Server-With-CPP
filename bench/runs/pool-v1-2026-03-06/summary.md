@@ -55,6 +55,7 @@ Additional stability validation was executed manually after the 6 saved cases:
 
 - Detailed record: `round1-regression-after-optimization.md`
 - Round-2 detailed record: `round2-regression-after-optimization.md`
+- Round-3 detailed record: `round3-regression-after-optimization.md`
 
 - `chat --count 750 --messages 200 --interval 0.001` repeated 5 times: all 5 runs `0 error`
 - `chat --count 750 --messages 200 --interval 0.002` repeated 5 times: all 5 runs `0 error`
@@ -109,3 +110,21 @@ With round-2 message-path optimization:
   - Fan-out P99: `80.66 ms -> 70.59 ms` (**-12.5%**)
 
 Current remaining bottleneck is still one-to-one chat tail latency under high concurrency.
+
+## Round 3 Delta (vs Round 2 Regression)
+
+With round-3 lock-scope optimization (`oneChat` local send moved out of `connMutex_`):
+
+- `chat (count=750, interval=2ms)`:
+  - Throughput: `10288.4/s -> 9442.9/s` (**-8.2%**)
+  - P50 latency: `1280.90 ms -> 413.65 ms` (**-67.7%**)
+  - P95 latency: `3240.24 ms -> 1405.54 ms` (**-56.6%**)
+  - P99 latency: `4656.87 ms -> 1727.40 ms` (**-62.9%**)
+- `group (1->100, interval=1ms)`:
+  - Throughput: `39.6/s -> 39.3/s` (**-0.8%**)
+  - P95 latency: `47.96 ms -> 29.82 ms` (**-37.8%**)
+  - P99 latency: `67.26 ms -> 53.87 ms` (**-19.9%**)
+  - Fan-out P95: `51.65 ms -> 35.00 ms` (**-32.2%**)
+  - Fan-out P99: `70.59 ms -> 59.07 ms` (**-16.3%**)
+
+Current remaining bottleneck likely shifts to Redis publish path serialization.

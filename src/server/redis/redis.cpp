@@ -52,7 +52,7 @@ bool Redis::connect()
     return true;
 }
 
-bool Redis::publish(int channel, string message)
+int Redis::publish(int channel, const string& message)
 {
     lock_guard<mutex> lock(publish_mtx_);
 
@@ -60,10 +60,12 @@ bool Redis::publish(int channel, string message)
     if (nullptr == reply)
     {
         cerr << "publish command failed!" << endl;
-        return false;
+        return -1;
     }
+
+    int subscribers = static_cast<int>(reply->integer);
     freeReplyObject(reply);
-    return true;
+    return subscribers;
 }
 
 bool Redis::subscribe(int channel)

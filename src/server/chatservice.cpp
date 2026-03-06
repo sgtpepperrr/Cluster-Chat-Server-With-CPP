@@ -227,6 +227,7 @@ void ChatService::clientCloseException(const TcpConnectionPtr& conn)
 void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time)
 {
     int toId = js["to"].get<int>();
+    string msg = js.dump();
 
     {
         lock_guard<mutex> lock(connMutex_);
@@ -235,21 +236,20 @@ void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time
         if (it != userConnMap_.end())
         {
             // toId在线且位于当前服务器，转发消息
-            it->second->send(js.dump());
+            it->second->send(msg);
             return;
         }
     }
 
-    // 查询toid是否在其它服务器登录
-    User user = userModel_.query(toId);
-    if (user.getState() == "online")
+    // 尝试通过Redis投递到其它节点。若无订阅者（或发布失败）则转离线消息。
+    int subscribers = redis_.publish(toId, msg);
+    if (subscribers > 0)
     {
-        redis_.publish(toId, js.dump());
         return;
     }
 
     // toId不在线，存储离线消息
-    offlineMsgModel_.insert(toId, js.dump());
+    offlineMsgModel_.insert(toId, msg);
 }
 
 // 处理服务器异常退出
@@ -328,18 +328,15 @@ void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp ti
         return;
     }
 
-    unordered_map<int, string> stateMap = userModel_.queryStates(otherNodeOrOfflineIds);
     for (int id : otherNodeOrOfflineIds)
     {
-        auto it = stateMap.find(id);
-        if (it != stateMap.end() && it->second == "online")
+        int subscribers = redis_.publish(id, msg);
+        if (subscribers > 0)
         {
-            redis_.publish(id, msg);
+            continue;
         }
-        else
-        {
-            offlineMsgModel_.insert(id, msg);
-        }
+
+        offlineMsgModel_.insert(id, msg);
     }
 }
 

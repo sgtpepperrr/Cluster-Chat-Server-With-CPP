@@ -17,7 +17,8 @@ public:
     ~Redis();
 
     bool connect();
-    bool publish(int channel, string message);
+    // Return subscriber count. <=0 means no subscriber or publish failed.
+    int publish(int channel, const string& message);
     bool subscribe(int channel);
     bool unsubscribe(int channel);
     

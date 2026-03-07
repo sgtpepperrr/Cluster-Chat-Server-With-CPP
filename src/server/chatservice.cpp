@@ -1,10 +1,149 @@
 #include "chatservice.hpp"
+#include "config.hpp"
 #include "public.hpp"
 #include <muduo/base/Logging.h>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <vector>
 
 using namespace muduo;
 using namespace std;
+
+namespace
+{
+using steady_clock = std::chrono::steady_clock;
+using microseconds = std::chrono::microseconds;
+
+uint64_t nowUs()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<microseconds>(
+            steady_clock::now().time_since_epoch()
+        ).count()
+    );
+}
+
+double avg(uint64_t total, uint64_t count)
+{
+    if (count == 0)
+    {
+        return 0.0;
+    }
+    return static_cast<double>(total) / static_cast<double>(count);
+}
+
+double pct(uint64_t part, uint64_t total)
+{
+    if (total == 0)
+    {
+        return 0.0;
+    }
+    return static_cast<double>(part) * 100.0 / static_cast<double>(total);
+}
+
+bool perfTraceEnabled()
+{
+    static bool enabled = []() {
+        loadEnvFile();
+        return getEnvIntOrDefault("CHAT_PERF_TRACE", 0) > 0;
+    }();
+    return enabled;
+}
+
+uint64_t perfReportEvery()
+{
+    static uint64_t every = []() {
+        int raw = getEnvIntOrDefault("CHAT_PERF_REPORT_EVERY", 2000);
+        if (raw <= 0)
+        {
+            raw = 2000;
+        }
+        return static_cast<uint64_t>(raw);
+    }();
+    return every;
+}
+
+std::atomic<uint64_t> g_oneMsgCount(0);
+std::atomic<uint64_t> g_oneLockWaitUs(0);
+std::atomic<uint64_t> g_oneLockHoldUs(0);
+std::atomic<uint64_t> g_oneLocalSendCount(0);
+std::atomic<uint64_t> g_oneLocalSendUs(0);
+std::atomic<uint64_t> g_oneRedisPublishCount(0);
+std::atomic<uint64_t> g_oneRedisPublishUs(0);
+std::atomic<uint64_t> g_oneRedisNoSubscriberCount(0);
+std::atomic<uint64_t> g_oneRedisFailCount(0);
+std::atomic<uint64_t> g_oneOfflineInsertCount(0);
+std::atomic<uint64_t> g_oneOfflineInsertUs(0);
+
+std::atomic<uint64_t> g_groupMsgCount(0);
+std::atomic<uint64_t> g_groupQueryUsersUs(0);
+std::atomic<uint64_t> g_groupReceiverCount(0);
+std::atomic<uint64_t> g_groupLockWaitUs(0);
+std::atomic<uint64_t> g_groupLockHoldUs(0);
+std::atomic<uint64_t> g_groupLocalSendCount(0);
+std::atomic<uint64_t> g_groupLocalSendUs(0);
+std::atomic<uint64_t> g_groupRedisPublishCount(0);
+std::atomic<uint64_t> g_groupRedisPublishUs(0);
+std::atomic<uint64_t> g_groupRedisNoSubscriberCount(0);
+std::atomic<uint64_t> g_groupRedisFailCount(0);
+std::atomic<uint64_t> g_groupOfflineInsertCount(0);
+std::atomic<uint64_t> g_groupOfflineInsertUs(0);
+
+void reportOneChatPerf(uint64_t msgCount)
+{
+    uint64_t localCount = g_oneLocalSendCount.load(std::memory_order_relaxed);
+    uint64_t redisCount = g_oneRedisPublishCount.load(std::memory_order_relaxed);
+    uint64_t offlineCount = g_oneOfflineInsertCount.load(std::memory_order_relaxed);
+
+    LOG_INFO << "[perf][oneChat] msgs=" << msgCount
+             << " local_hit=" << pct(localCount, msgCount) << "%"
+             << " redis_path=" << pct(redisCount, msgCount) << "%"
+             << " offline_path=" << pct(offlineCount, msgCount) << "%"
+             << " avg_lock_wait_us="
+             << avg(g_oneLockWaitUs.load(std::memory_order_relaxed), msgCount)
+             << " avg_lock_hold_us="
+             << avg(g_oneLockHoldUs.load(std::memory_order_relaxed), msgCount)
+             << " avg_local_send_us="
+             << avg(g_oneLocalSendUs.load(std::memory_order_relaxed), localCount)
+             << " avg_redis_pub_us="
+             << avg(g_oneRedisPublishUs.load(std::memory_order_relaxed), redisCount)
+             << " avg_offline_insert_us="
+             << avg(g_oneOfflineInsertUs.load(std::memory_order_relaxed), offlineCount)
+             << " redis_no_subscribers=" << g_oneRedisNoSubscriberCount.load(std::memory_order_relaxed)
+             << " redis_publish_fail=" << g_oneRedisFailCount.load(std::memory_order_relaxed);
+}
+
+void reportGroupChatPerf(uint64_t msgCount)
+{
+    uint64_t receivers = g_groupReceiverCount.load(std::memory_order_relaxed);
+    uint64_t localCount = g_groupLocalSendCount.load(std::memory_order_relaxed);
+    uint64_t redisCount = g_groupRedisPublishCount.load(std::memory_order_relaxed);
+    uint64_t offlineCount = g_groupOfflineInsertCount.load(std::memory_order_relaxed);
+
+    LOG_INFO << "[perf][groupChat] msgs=" << msgCount
+             << " avg_receivers_per_msg=" << avg(receivers, msgCount)
+             << " local_receiver_ratio=" << pct(localCount, receivers) << "%"
+             << " redis_receiver_ratio=" << pct(redisCount, receivers) << "%"
+             << " offline_receiver_ratio=" << pct(offlineCount, receivers) << "%"
+             << " avg_query_users_us="
+             << avg(g_groupQueryUsersUs.load(std::memory_order_relaxed), msgCount)
+             << " avg_lock_wait_us="
+             << avg(g_groupLockWaitUs.load(std::memory_order_relaxed), msgCount)
+             << " avg_lock_hold_us="
+             << avg(g_groupLockHoldUs.load(std::memory_order_relaxed), msgCount)
+             << " avg_local_send_us="
+             << avg(g_groupLocalSendUs.load(std::memory_order_relaxed), localCount)
+             << " avg_redis_pub_us="
+             << avg(g_groupRedisPublishUs.load(std::memory_order_relaxed), redisCount)
+             << " avg_offline_insert_us="
+             << avg(g_groupOfflineInsertUs.load(std::memory_order_relaxed), offlineCount)
+             << " redis_no_subscribers="
+             << g_groupRedisNoSubscriberCount.load(std::memory_order_relaxed)
+             << " redis_publish_fail="
+             << g_groupRedisFailCount.load(std::memory_order_relaxed);
+}
+} // namespace
 
 ChatService* ChatService::instance()
 {
@@ -226,35 +365,139 @@ void ChatService::clientCloseException(const TcpConnectionPtr& conn)
 
 void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time)
 {
+    bool perf = perfTraceEnabled();
     int toId = js["to"].get<int>();
     string msg = js.dump();
     TcpConnectionPtr targetConn;
+    uint64_t lockWaitUs = 0;
+    uint64_t lockHoldUs = 0;
+    uint64_t localSendUs = 0;
+    uint64_t redisPublishUs = 0;
+    uint64_t offlineInsertUs = 0;
+    bool localPath = false;
+    bool redisPath = false;
+    bool redisNoSubscriber = false;
+    bool redisPublishFail = false;
+    bool offlinePath = false;
+    uint64_t waitStartUs = 0;
+    uint64_t lockAcquiredUs = 0;
+    if (perf)
+    {
+        waitStartUs = nowUs();
+    }
 
     {
-        lock_guard<mutex> lock(connMutex_);
+        unique_lock<mutex> lock(connMutex_);
+        if (perf)
+        {
+            lockAcquiredUs = nowUs();
+            lockWaitUs = lockAcquiredUs - waitStartUs;
+        }
+
         auto it = userConnMap_.find(toId);
         if (it != userConnMap_.end())
         {
             targetConn = it->second;
+        }
+
+        if (perf)
+        {
+            lockHoldUs = nowUs() - lockAcquiredUs;
         }
     }
 
     if (targetConn)
     {
         // toId在线且位于当前服务器，转发消息
+        localPath = true;
+        uint64_t localSendStartUs = 0;
+        if (perf)
+        {
+            localSendStartUs = nowUs();
+        }
         targetConn->send(msg);
-        return;
+        if (perf)
+        {
+            localSendUs = nowUs() - localSendStartUs;
+        }
+    }
+    else
+    {
+        redisPath = true;
+        uint64_t redisPublishStartUs = 0;
+        if (perf)
+        {
+            redisPublishStartUs = nowUs();
+        }
+
+        // 尝试通过Redis投递到其它节点。若无订阅者（或发布失败）则转离线消息。
+        int subscribers = redis_.publish(toId, msg);
+        if (perf)
+        {
+            redisPublishUs = nowUs() - redisPublishStartUs;
+        }
+
+        if (subscribers <= 0)
+        {
+            redisNoSubscriber = (subscribers == 0);
+            redisPublishFail = (subscribers < 0);
+            offlinePath = true;
+
+            // toId不在线，存储离线消息
+            uint64_t offlineInsertStartUs = 0;
+            if (perf)
+            {
+                offlineInsertStartUs = nowUs();
+            }
+            offlineMsgModel_.insert(toId, msg);
+            if (perf)
+            {
+                offlineInsertUs = nowUs() - offlineInsertStartUs;
+            }
+        }
     }
 
-    // 尝试通过Redis投递到其它节点。若无订阅者（或发布失败）则转离线消息。
-    int subscribers = redis_.publish(toId, msg);
-    if (subscribers > 0)
+    if (!perf)
     {
         return;
     }
 
-    // toId不在线，存储离线消息
-    offlineMsgModel_.insert(toId, msg);
+    uint64_t msgCount = g_oneMsgCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_oneLockWaitUs.fetch_add(lockWaitUs, std::memory_order_relaxed);
+    g_oneLockHoldUs.fetch_add(lockHoldUs, std::memory_order_relaxed);
+
+    if (localPath)
+    {
+        g_oneLocalSendCount.fetch_add(1, std::memory_order_relaxed);
+        g_oneLocalSendUs.fetch_add(localSendUs, std::memory_order_relaxed);
+    }
+
+    if (redisPath)
+    {
+        g_oneRedisPublishCount.fetch_add(1, std::memory_order_relaxed);
+        g_oneRedisPublishUs.fetch_add(redisPublishUs, std::memory_order_relaxed);
+    }
+
+    if (redisNoSubscriber)
+    {
+        g_oneRedisNoSubscriberCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (redisPublishFail)
+    {
+        g_oneRedisFailCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (offlinePath)
+    {
+        g_oneOfflineInsertCount.fetch_add(1, std::memory_order_relaxed);
+        g_oneOfflineInsertUs.fetch_add(offlineInsertUs, std::memory_order_relaxed);
+    }
+
+    if (msgCount % perfReportEvery() == 0)
+    {
+        reportOneChatPerf(msgCount);
+    }
 }
 
 // 处理服务器异常退出
@@ -293,8 +536,110 @@ void ChatService::addGroup(const TcpConnectionPtr& conn, json& js, Timestamp tim
 
 void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp time)
 {
+    bool perf = perfTraceEnabled();
     int userid = js["id"].get<int>();
     int groupid = js["groupid"].get<int>();
+
+    uint64_t queryUsersUs = 0;
+    if (perf)
+    {
+        uint64_t queryStartUs = nowUs();
+        vector<int> tmp = groupModel_.queryGroupUsers(userid, groupid);
+        queryUsersUs = nowUs() - queryStartUs;
+        if (tmp.empty())
+        {
+            return;
+        }
+
+        vector<int> userIdVec = tmp;
+        string msg = js.dump();
+        vector<TcpConnectionPtr> localConns;
+        vector<int> otherNodeOrOfflineIds;
+        localConns.reserve(userIdVec.size());
+        otherNodeOrOfflineIds.reserve(userIdVec.size());
+
+        uint64_t lockWaitUs = 0;
+        uint64_t lockHoldUs = 0;
+        uint64_t waitStartUs = nowUs();
+        {
+            unique_lock<mutex> lock(connMutex_);
+            uint64_t lockAcquiredUs = nowUs();
+            lockWaitUs = lockAcquiredUs - waitStartUs;
+            for (int id : userIdVec)
+            {
+                auto it = userConnMap_.find(id);
+                if (it != userConnMap_.end())
+                {
+                    localConns.push_back(it->second);
+                }
+                else
+                {
+                    otherNodeOrOfflineIds.push_back(id);
+                }
+            }
+            lockHoldUs = nowUs() - lockAcquiredUs;
+        }
+
+        uint64_t localSendUs = 0;
+        for (const auto& userConn : localConns)
+        {
+            uint64_t sendStartUs = nowUs();
+            userConn->send(msg);
+            localSendUs += (nowUs() - sendStartUs);
+        }
+
+        uint64_t redisPublishUs = 0;
+        uint64_t offlineInsertUs = 0;
+        uint64_t redisNoSubscriberCount = 0;
+        uint64_t redisFailCount = 0;
+        uint64_t offlineInsertCount = 0;
+        for (int id : otherNodeOrOfflineIds)
+        {
+            uint64_t redisStartUs = nowUs();
+            int subscribers = redis_.publish(id, msg);
+            redisPublishUs += (nowUs() - redisStartUs);
+            if (subscribers > 0)
+            {
+                continue;
+            }
+
+            if (subscribers == 0)
+            {
+                ++redisNoSubscriberCount;
+            }
+            else
+            {
+                ++redisFailCount;
+            }
+
+            ++offlineInsertCount;
+            uint64_t offlineStartUs = nowUs();
+            offlineMsgModel_.insert(id, msg);
+            offlineInsertUs += (nowUs() - offlineStartUs);
+        }
+
+        uint64_t msgCount = g_groupMsgCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_groupQueryUsersUs.fetch_add(queryUsersUs, std::memory_order_relaxed);
+        g_groupReceiverCount.fetch_add(userIdVec.size(), std::memory_order_relaxed);
+        g_groupLockWaitUs.fetch_add(lockWaitUs, std::memory_order_relaxed);
+        g_groupLockHoldUs.fetch_add(lockHoldUs, std::memory_order_relaxed);
+        g_groupLocalSendCount.fetch_add(localConns.size(), std::memory_order_relaxed);
+        g_groupLocalSendUs.fetch_add(localSendUs, std::memory_order_relaxed);
+        g_groupRedisPublishCount.fetch_add(otherNodeOrOfflineIds.size(), std::memory_order_relaxed);
+        g_groupRedisPublishUs.fetch_add(redisPublishUs, std::memory_order_relaxed);
+        g_groupRedisNoSubscriberCount.fetch_add(redisNoSubscriberCount, std::memory_order_relaxed);
+        g_groupRedisFailCount.fetch_add(redisFailCount, std::memory_order_relaxed);
+        g_groupOfflineInsertCount.fetch_add(offlineInsertCount, std::memory_order_relaxed);
+        g_groupOfflineInsertUs.fetch_add(offlineInsertUs, std::memory_order_relaxed);
+
+        if (msgCount % perfReportEvery() == 0)
+        {
+            reportGroupChatPerf(msgCount);
+        }
+
+        return;
+    }
+
     vector<int> userIdVec = groupModel_.queryGroupUsers(userid, groupid);
     if (userIdVec.empty())
     {

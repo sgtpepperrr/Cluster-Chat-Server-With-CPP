@@ -94,10 +94,13 @@ CHAT_INTER_NODE_PORT=6101 ./bin/ChatServer 127.0.0.1 6001
 
 说明：
 - 客户端入口端口仍然是命令行里的 `6000/6001`
-- 节点间内部通信端口由 `CHAT_INTER_NODE_PORT` 指定
+- 节点间内部通信端口默认使用 `客户端端口 + 100`，也可用 `CHAT_INTER_NODE_PORT` 显式覆盖
+- 客户端入口的 worker 线程数由 `CHAT_SERVER_IO_THREADS` 指定
+- 集群内部收件线程数由 `CHAT_CLUSTER_IO_THREADS` 指定
 - `ClusterRouter` 使用 Muduo 异步客户端长连接，I/O 线程数由 `CHAT_INTER_NODE_IO_THREADS` 指定
 - 连接建立阶段的瞬时排队上限由 `CHAT_INTER_NODE_CONNECTING_QUEUE_LIMIT` 指定
 - 单连接输出缓冲背压阈值由 `CHAT_INTER_NODE_HIGH_WATER_MARK` 指定
+- 本地按 EventLoop 分桶的投递队列上限由 `CHAT_LOCAL_DELIVERY_QUEUE_LIMIT` 指定
 - 若未显式设置，内部端口默认使用 `客户端端口 + 100`
 
 5. 配置并启动 Nginx TCP 负载均衡

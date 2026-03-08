@@ -1,6 +1,11 @@
 #include "chatservice.hpp"
+#include "clusterrouter.hpp"
+#include "config.hpp"
+#include "noderegistry.hpp"
 #include "public.hpp"
 #include <muduo/base/Logging.h>
+#include <chrono>
+#include <sstream>
 #include <vector>
 
 using namespace muduo;
@@ -13,6 +18,11 @@ ChatService* ChatService::instance()
 }
 
 ChatService::ChatService()
+    : localDeliveryCount_(0)
+    , remoteRouteCount_(0)
+    , remoteRouteFailCount_(0)
+    , offlineFallbackCount_(0)
+    , staleSessionCount_(0)
 {
     msgHandlerMap_.insert({LOGIN_MSG, std::bind(&ChatService::login, this, _1, _2, _3)});
     msgHandlerMap_.insert({LOGOUT_MSG, std::bind(&ChatService::logout, this, _1, _2, _3)});
@@ -24,11 +34,49 @@ ChatService::ChatService()
     msgHandlerMap_.insert({ADD_GROUP_MSG, std::bind(&ChatService::addGroup, this, _1, _2, _3)});
     msgHandlerMap_.insert({GROUP_CHAT_MSG, std::bind(&ChatService::groupChat, this, _1, _2, _3)});
 
-    // 连接redis服务器
     if (redis_.connect())
     {
-        // 设置上报消息的回调
         redis_.init_notify_handler(std::bind(&ChatService::handleRedisSubscribeMessage, this, _1, _2));
+    }
+
+}
+
+void ChatService::initNode(EventLoop* baseLoop,
+                           const string& clientIp,
+                           uint16_t clientPort,
+                           const string& interIp,
+                           uint16_t interPort)
+{
+    selfNode_.clientIp = clientIp;
+    selfNode_.clientPort = clientPort;
+    selfNode_.interIp = interIp;
+    selfNode_.interPort = interPort;
+    selfNode_.nodeId = interIp + ":" + to_string(interPort);
+    selfNode_.heartbeatMs = chrono::duration_cast<chrono::milliseconds>(
+        chrono::system_clock::now().time_since_epoch()).count();
+    selfNode_.instanceId = selfNode_.nodeId + "#" + to_string(selfNode_.heartbeatMs);
+
+    nodeRegistry_.reset(new NodeRegistry(&redis_));
+    clusterRouter_.reset(new ClusterRouter(baseLoop));
+
+    loadEnvFile();
+    int heartbeatIntervalMs = getEnvIntOrDefault("CHAT_HEARTBEAT_INTERVAL_MS", 3000);
+    int heartbeatTimeoutMs = getEnvIntOrDefault("CHAT_HEARTBEAT_TIMEOUT_MS", 10000);
+    if (!nodeRegistry_->init(selfNode_, heartbeatIntervalMs, heartbeatTimeoutMs))
+    {
+        LOG_ERROR << "failed to initialize node registry for " << selfNode_.nodeId;
+        return;
+    }
+
+    // 启动时把当前已知的远端节点先预热一遍。
+    // 这样首轮 oneChat 压测时，不会所有跨节点消息都一起去触发 connect。
+    vector<NodeMeta> nodes = nodeRegistry_->listNodes();
+    for (const NodeMeta& nodeMeta : nodes)
+    {
+        if (!nodeRegistry_->isSelfNode(nodeMeta.nodeId) && clusterRouter_)
+        {
+            clusterRouter_->prewarmNode(nodeMeta);
+        }
     }
 }
 
@@ -54,11 +102,16 @@ void ChatService::login(const TcpConnectionPtr& conn, json& js, Timestamp time)
     string pwd = js["password"];
 
     User user = userModel_.query(id);
+
+    // 先查控制面里的会话归属，而不是只看数据库里的 online/offline。
+    // 原因：数据库状态只能说明“曾经在线”，无法说明“当前到底归属哪个活节点”。
+    // 要保证“一个在线用户只归属一个节点”，因此登录先看 Redis 路由表。
+    string existingNodeId;
+    bool hasValidSession = nodeRegistry_ && nodeRegistry_->queryUserNode(id, existingNodeId);
     if (user.getId() == id && user.getPwd() == pwd)
     {
-        if (user.getState() == "online")
+        if (hasValidSession)
         {
-            // 该用户已经登录，不允许重复登录
             json resp;
             resp["msgId"] = LOGIN_MSG_ACK;
             resp["errno"] = 2;
@@ -67,13 +120,33 @@ void ChatService::login(const TcpConnectionPtr& conn, json& js, Timestamp time)
         }
         else
         {
-            // 登录成功
+            if (user.getState() == "online")
+            {
+                user.setState("offline");
+                userModel_.updateState(user);
+                ++staleSessionCount_;
+            }
+
             {
                 lock_guard<mutex> lock(connMutex_);
                 userConnMap_.insert({id, conn});
             }
 
-            redis_.subscribe(id);
+            // 登录成功后，把用户归属写入控制面：userId -> nodeId。
+            // 为什么要这样做：后续别的节点给该用户发消息时，
+            // 第一件事就是查“这个用户现在在哪个节点”。
+            if (nodeRegistry_ && !nodeRegistry_->bindUser(id))
+            {
+                lock_guard<mutex> lock(connMutex_);
+                userConnMap_.erase(id);
+
+                json resp;
+                resp["msgId"] = LOGIN_MSG_ACK;
+                resp["errno"] = 3;
+                resp["errmsg"] = "register session failed";
+                conn->send(resp.dump());
+                return;
+            }
 
             user.setState("online");
             userModel_.updateState(user);
@@ -190,7 +263,10 @@ void ChatService::logout(const TcpConnectionPtr& conn, json& js, Timestamp time)
         }
     }
 
-    redis_.unsubscribe(userid);
+    if (nodeRegistry_)
+    {
+        nodeRegistry_->unbindUser(userid);
+    }
 
     User user(userid, "", "", "offline");
     userModel_.updateState(user);
@@ -215,10 +291,13 @@ void ChatService::clientCloseException(const TcpConnectionPtr& conn)
         }
     }
 
-    redis_.unsubscribe(user.getId());
-
     if (user.getId() != -1)
     {
+        if (nodeRegistry_)
+        {
+            nodeRegistry_->unbindUser(user.getId());
+        }
+
         user.setState("offline");
         userModel_.updateState(user);
     }
@@ -227,39 +306,95 @@ void ChatService::clientCloseException(const TcpConnectionPtr& conn)
 void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time)
 {
     int toId = js["to"].get<int>();
+    int fromId = js["id"].get<int>();
     string msg = js.dump();
-    TcpConnectionPtr targetConn;
 
+    // 第一步永远先走本地直发。
+    // 原因：本地命中路径最短，不需要查 Redis，也不需要跨节点网络开销。
+    if (deliverToLocalUser(toId, msg))
     {
-        lock_guard<mutex> lock(connMutex_);
-        auto it = userConnMap_.find(toId);
-        if (it != userConnMap_.end())
+        ++localDeliveryCount_;
+        return;
+    }
+
+    string nodeId;
+    NodeMeta nodeMeta;
+
+    // 第二步查控制面里的 userId -> nodeId。
+    // Redis 在这里不再负责“转发消息”，只负责回答“目标用户属于哪个节点”。
+    if (nodeRegistry_ && nodeRegistry_->resolveUserNode(toId, nodeId, nodeMeta))
+    {
+        if (nodeRegistry_->isSelfNode(nodeId))
         {
-            targetConn = it->second;
+            // Redis 说用户在本节点，但本地连接表里又没找到该用户，
+            // 这说明控制面留下了脏路由，需要清理掉。
+            ++staleSessionCount_;
+            nodeRegistry_->unbindUser(toId);
+        }
+        else
+        {
+            // 一旦确认了远端节点归属，就顺手做一次异步预热。
+            // 即使当前请求马上也要发消息，后续同节点流量也能直接复用热连接。
+            if (clusterRouter_)
+            {
+                clusterRouter_->prewarmNode(nodeMeta);
+            }
+
+            // 已知目标用户属于远端节点后，直接走节点间 TCP 直连数据面。
+            // 从“共享 Redis 转发”变成“已知地址后的定向直投”。
+            if (clusterRouter_ &&
+                clusterRouter_->sendOneChat(nodeMeta, selfNode_.nodeId, toId, msg, buildTraceId(fromId)))
+            {
+                ++remoteRouteCount_;
+                return;
+            }
+
+            ++remoteRouteFailCount_;
         }
     }
 
-    if (targetConn)
-    {
-        // toId在线且位于当前服务器，转发消息
-        targetConn->send(msg);
-        return;
-    }
-
-    // 尝试通过Redis投递到其它节点。若无订阅者（或发布失败）则转离线消息。
-    int subscribers = redis_.publish(toId, msg);
-    if (subscribers > 0)
-    {
-        return;
-    }
-
-    // toId不在线，存储离线消息
+    // 既不在本地，也没有有效远端归属，或者远端投递失败，
+    // 最终统一降级为离线消息，保证消息不会在热路径里丢失。
+    ++offlineFallbackCount_;
     offlineMsgModel_.insert(toId, msg);
 }
 
 // 处理服务器异常退出
 void ChatService::reset()
 {
+    vector<int> selfUsers;
+    if (nodeRegistry_)
+    {
+        selfUsers = redis_.getNodeUsers(selfNode_.nodeId);
+    }
+
+    if (nodeRegistry_)
+    {
+        nodeRegistry_->stop();
+        nodeRegistry_->cleanupSelf();
+    }
+
+    if (clusterRouter_)
+    {
+        clusterRouter_->closeAll();
+    }
+
+    LOG_INFO << "cluster metrics local=" << localDeliveryCount_.load()
+             << " remote=" << remoteRouteCount_.load()
+             << " remote_fail=" << remoteRouteFailCount_.load()
+             << " offline=" << offlineFallbackCount_.load()
+             << " stale_session=" << staleSessionCount_.load();
+
+    if (nodeRegistry_)
+    {
+        for (int userId : selfUsers)
+        {
+            User user(userId, "", "", "offline");
+            userModel_.updateState(user);
+        }
+        return;
+    }
+
     userModel_.resetState();
 }
 
@@ -303,9 +438,11 @@ void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp ti
 
     string msg = js.dump();
     vector<TcpConnectionPtr> localConns;
-    vector<int> otherNodeOrOfflineIds;
+    vector<int> offlineIds;
+    vector<int> unresolvedIds;
+    unordered_map<string, vector<int>> remoteNodeUsers;
     localConns.reserve(userIdVec.size());
-    otherNodeOrOfflineIds.reserve(userIdVec.size());
+    unresolvedIds.reserve(userIdVec.size());
 
     {
         lock_guard<mutex> lock(connMutex_);
@@ -318,29 +455,67 @@ void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp ti
             }
             else
             {
-                otherNodeOrOfflineIds.push_back(id);
+                unresolvedIds.push_back(id);
             }
+        }
+    }
+
+    // 对不在本地连接表中的用户，再去控制面查归属。
+    // 这里要先释放 connMutex_，避免把“本地连接表锁”扩展成包含 Redis 查询的长临界区。
+    for (int id : unresolvedIds)
+    {
+        string nodeId;
+        NodeMeta nodeMeta;
+        if (nodeRegistry_ && nodeRegistry_->resolveUserNode(id, nodeId, nodeMeta))
+        {
+            if (nodeRegistry_->isSelfNode(nodeId))
+            {
+                ++staleSessionCount_;
+                nodeRegistry_->unbindUser(id);
+                offlineIds.push_back(id);
+            }
+            else
+            {
+                remoteNodeUsers[nodeId].push_back(id);
+            }
+        }
+        else
+        {
+            offlineIds.push_back(id);
         }
     }
 
     for (const auto& userConn : localConns)
     {
         userConn->send(msg);
+        ++localDeliveryCount_;
     }
 
-    if (otherNodeOrOfflineIds.empty())
+    // 群聊跨节点按 nodeId 分桶发送，而不是按用户逐个远端发送。
+    // 这样做的原因是：跨节点成本按“节点数”计，而不是按“用户数”计。
+    if (!remoteNodeUsers.empty())
     {
-        return;
-    }
-
-    for (int id : otherNodeOrOfflineIds)
-    {
-        int subscribers = redis_.publish(id, msg);
-        if (subscribers > 0)
+        for (auto& entry : remoteNodeUsers)
         {
-            continue;
-        }
+            NodeMeta nodeMeta;
+            if (nodeRegistry_ && clusterRouter_ && nodeRegistry_->queryNode(entry.first, nodeMeta))
+            {
+                clusterRouter_->prewarmNode(nodeMeta);
+                if (clusterRouter_->sendGroupChat(nodeMeta, selfNode_.nodeId, entry.second, msg, buildTraceId(userid)))
+                {
+                    ++remoteRouteCount_;
+                    continue;
+                }
+            }
 
+            ++remoteRouteFailCount_;
+            offlineIds.insert(offlineIds.end(), entry.second.begin(), entry.second.end());
+        }
+    }
+
+    for (int id : offlineIds)
+    {
+        ++offlineFallbackCount_;
         offlineMsgModel_.insert(id, msg);
     }
 }
@@ -348,22 +523,123 @@ void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp ti
 // 从redis消息队列中获取订阅的消息
 void ChatService::handleRedisSubscribeMessage(int userid, string msg)
 {
-    TcpConnectionPtr conn;
+    if (deliverToLocalUser(userid, msg))
     {
-        lock_guard<mutex> lock(connMutex_);
-        auto it = userConnMap_.find(userid);
-        if (it != userConnMap_.end())
-        {
-            conn = it->second;
-        }
-    }
-
-    if (conn)
-    {
-        conn->send(msg);
+        ++localDeliveryCount_;
         return;
     }
 
-    // 存储该用户的离线消息
+    ++offlineFallbackCount_;
     offlineMsgModel_.insert(userid, msg);
+}
+
+void ChatService::handleClusterMessage(json& js)
+{
+    // 内部消息和客户端消息是两套协议：
+    // 客户端消息负责聊天业务，内部消息负责节点间路由投递。
+    int msgId = js["msgId"].get<int>();
+    if (msgId == NODE_ROUTE_ONE_CHAT_MSG)
+    {
+        handleClusterOneChat(js);
+        return;
+    }
+
+    if (msgId == NODE_ROUTE_GROUP_CHAT_MSG)
+    {
+        handleClusterGroupChat(js);
+        return;
+    }
+
+    LOG_ERROR << "unknown cluster msgId: " << msgId;
+}
+
+TcpConnectionPtr ChatService::getLocalConnection(int userId)
+{
+    lock_guard<mutex> lock(connMutex_);
+    auto it = userConnMap_.find(userId);
+    if (it == userConnMap_.end())
+    {
+        return TcpConnectionPtr();
+    }
+
+    return it->second;
+}
+
+bool ChatService::deliverToLocalUser(int userId, const string& msg)
+{
+    TcpConnectionPtr conn = getLocalConnection(userId);
+    if (!conn)
+    {
+        return false;
+    }
+
+    conn->send(msg);
+    return true;
+}
+
+string ChatService::buildTraceId(int fromUserId) const
+{
+    long long nowMs = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now().time_since_epoch()).count();
+    ostringstream oss;
+    oss << selfNode_.nodeId << '-' << fromUserId << '-' << nowMs;
+    return oss.str();
+}
+
+void ChatService::handleClusterOneChat(json& js)
+{
+    int toUser = js["toUser"].get<int>();
+    string payload = js["payload"];
+    if (deliverToLocalUser(toUser, payload))
+    {
+        ++localDeliveryCount_;
+        return;
+    }
+
+    if (nodeRegistry_)
+    {
+        string nodeId;
+        if (nodeRegistry_->queryUserNode(toUser, nodeId) && !nodeRegistry_->isSelfNode(nodeId))
+        {
+            ++staleSessionCount_;
+        }
+        else
+        {
+            nodeRegistry_->unbindUser(toUser);
+        }
+    }
+
+    ++offlineFallbackCount_;
+    offlineMsgModel_.insert(toUser, payload);
+}
+
+void ChatService::handleClusterGroupChat(json& js)
+{
+    vector<int> toUsers = js["toUsers"].get<vector<int>>();
+    string payload = js["payload"];
+
+    for (int userId : toUsers)
+    {
+        if (deliverToLocalUser(userId, payload))
+        {
+            ++localDeliveryCount_;
+            continue;
+        }
+
+        if (nodeRegistry_)
+        {
+            string nodeId;
+            if (nodeRegistry_->queryUserNode(userId, nodeId) && !nodeRegistry_->isSelfNode(nodeId))
+            {
+                ++staleSessionCount_;
+            }
+            else
+            {
+                nodeRegistry_->unbindUser(userId);
+            }
+        }
+
+        ++offlineFallbackCount_;
+        offlineMsgModel_.insert(userId, payload);
+    }
 }

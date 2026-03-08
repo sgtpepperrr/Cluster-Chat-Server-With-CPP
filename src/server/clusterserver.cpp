@@ -1,6 +1,7 @@
-#include "chatserver.hpp"
+#include "clusterserver.hpp"
 #include "chatservice.hpp"
 #include "json.hpp"
+
 #include <muduo/base/Logging.h>
 #include <functional>
 #include <string>
@@ -9,45 +10,39 @@ using namespace std;
 using namespace placeholders;
 using json = nlohmann::json;
 
-ChatServer::ChatServer(EventLoop* loop,
-               const InetAddress& listenAddr,  // IP + port
-               const string& nameArg)          // 服务器的名字
+ClusterServer::ClusterServer(EventLoop* loop,
+                             const InetAddress& listenAddr,
+                             const string& nameArg)
     : server_(loop, listenAddr, nameArg)
     , loop_(loop)
 {
-    // 给服务器注册用户连接的创建和断开的回调
-    server_.setConnectionCallback(std::bind(&ChatServer::onConnection, this, _1));
-
-    // 给服务器注册用户读写事件的回调
-    server_.setMessageCallback(std::bind(&ChatServer::onMessage, this, _1, _2, _3));
-
-    // 设置服务器端的线程数量
+    server_.setConnectionCallback(std::bind(&ClusterServer::onConnection, this, _1));
+    server_.setMessageCallback(std::bind(&ClusterServer::onMessage, this, _1, _2, _3));
     server_.setThreadNum(4);
 }
 
-void ChatServer::start()
+void ClusterServer::start()
 {
     server_.start();
 }
 
-// 处理用户连接的创建和断开
-void ChatServer::onConnection(const TcpConnectionPtr& conn)
+void ClusterServer::onConnection(const TcpConnectionPtr& conn)
 {
     if (conn->connected())
     {
+        // TCP 是字节流，不保证一次 onMessage 就是一条完整 JSON。
+        // 因此每条内部连接都要挂一个“残留字节缓冲区”，把半包攒起来。
         conn->setContext(string());
         return;
     }
 
-    ChatService::instance()->clientCloseException(conn);
     conn->shutdown();
 }
 
-// 处理用户的读写事件
-void ChatServer::onMessage(const TcpConnectionPtr& conn,
-               Buffer* buffer,
-               Timestamp time)  // 接收到数据的时间信息
+void ClusterServer::onMessage(const TcpConnectionPtr& conn, Buffer* buffer, Timestamp time)
 {
+    (void)time;
+
     if (conn->getContext().empty())
     {
         conn->setContext(string());
@@ -56,14 +51,15 @@ void ChatServer::onMessage(const TcpConnectionPtr& conn,
     string* pending = boost::any_cast<string>(conn->getMutableContext());
     if (pending == nullptr)
     {
-        LOG_ERROR << "client connection context type mismatch";
+        LOG_ERROR << "cluster connection context type mismatch";
         conn->setContext(string());
         pending = boost::any_cast<string>(conn->getMutableContext());
     }
 
+    // 内部协议仍旧使用 '\0' 作为分隔符，但现在按“流式字节缓冲”处理：
+    // 先把本次读到的字节追加到连接级缓存里，再只解析完整帧，把半包留到下次。
     pending->append(buffer->retrieveAllAsString());
 
-    // 按 \0 分割处理完整消息；没有收完整的尾巴留在连接上下文里，等下一次字节到达。
     size_t start = 0;
     while (true)
     {
@@ -78,12 +74,11 @@ void ChatServer::onMessage(const TcpConnectionPtr& conn,
             try
             {
                 json js = json::parse(pending->begin() + start, pending->begin() + end);
-                auto msgHandler = ChatService::instance()->getHandler(js["msgId"].get<int>());
-                msgHandler(conn, js, time);
+                ChatService::instance()->handleClusterMessage(js);
             }
             catch (const json::exception& e)
             {
-                LOG_ERROR << "onMessage parse error: " << e.what();
+                LOG_ERROR << "cluster onMessage parse error: " << e.what();
             }
         }
 
@@ -95,4 +90,3 @@ void ChatServer::onMessage(const TcpConnectionPtr& conn,
         pending->erase(0, start);
     }
 }
-

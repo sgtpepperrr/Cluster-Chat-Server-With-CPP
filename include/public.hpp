@@ -14,6 +14,11 @@ enum EnMsgType
     CREATE_GROUP_MSG,
     ADD_GROUP_MSG,     // 加入群组
     GROUP_CHAT_MSG,    // 群聊天
+
+    NODE_ROUTE_ONE_CHAT_MSG = 100,
+    NODE_ROUTE_GROUP_CHAT_MSG,
+    NODE_PING_MSG,
+    NODE_PONG_MSG,
 };
 
 #endif /* PUBLIC_H */

@@ -2,8 +2,11 @@
 #define CHATSERVICE_H
 
 #include <unordered_map>
+#include <memory>
+#include <atomic>
 #include <functional>
 #include <mutex>
+#include <muduo/net/EventLoop.h>
 #include <muduo/net/TcpConnection.h>
 #include "json.hpp"
 #include "usermodel.hpp"
@@ -11,6 +14,7 @@
 #include "friendmodel.hpp"
 #include "groupmodel.hpp"
 #include "redis.hpp"
+#include "clustertypes.hpp"
 
 using namespace std;
 using namespace muduo;
@@ -23,6 +27,12 @@ class ChatService
 {
 public:
     static ChatService* instance();
+
+    void initNode(EventLoop* baseLoop,
+                  const string& clientIp,
+                  uint16_t clientPort,
+                  const string& interIp,
+                  uint16_t interPort);
     
     void login(const TcpConnectionPtr& conn, json& js, Timestamp time);
     void logout(const TcpConnectionPtr& conn, json& js, Timestamp time);
@@ -48,8 +58,16 @@ public:
     // 从redis消息队列中获取订阅的消息
     void handleRedisSubscribeMessage(int, string);
 
+    void handleClusterMessage(json& js);
+
 private:
     ChatService();
+
+    TcpConnectionPtr getLocalConnection(int userId);
+    bool deliverToLocalUser(int userId, const string& msg);
+    string buildTraceId(int fromUserId) const;
+    void handleClusterOneChat(json& js);
+    void handleClusterGroupChat(json& js);
 
     unordered_map<int, MsgHandler> msgHandlerMap_;
 
@@ -67,6 +85,16 @@ private:
     GroupModel groupModel_;
 
     Redis redis_;
+
+    unique_ptr<class NodeRegistry> nodeRegistry_;
+    unique_ptr<class ClusterRouter> clusterRouter_;
+    NodeMeta selfNode_;
+
+    atomic<long long> localDeliveryCount_;
+    atomic<long long> remoteRouteCount_;
+    atomic<long long> remoteRouteFailCount_;
+    atomic<long long> offlineFallbackCount_;
+    atomic<long long> staleSessionCount_;
 };
 
 #endif /* CHATSERVICE_H */

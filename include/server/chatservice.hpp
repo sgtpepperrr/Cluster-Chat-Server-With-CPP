@@ -74,6 +74,7 @@ private:
     {
         TcpConnectionPtr conn;
         string msg;
+        long long enqueueNs;
     };
 
     struct LocalLoopDispatcher
@@ -137,6 +138,28 @@ private:
     atomic<long long> remoteRouteFailCount_;
     atomic<long long> offlineFallbackCount_;
     atomic<long long> staleSessionCount_;
+
+    // oneChat 分阶段观测指标：只做聚合统计，不做逐条日志。
+    atomic<long long> oneChatSourceCount_;
+    atomic<long long> oneChatResolveCount_;
+    atomic<long long> oneChatResolveNs_;
+    atomic<long long> oneChatRemoteSendCount_;
+    atomic<long long> oneChatRemoteSendNs_;
+    atomic<long long> oneChatRemoteHandleCount_;
+    atomic<long long> oneChatRemoteHandleNs_;
+
+    atomic<long long> localLookupCount_;
+    atomic<long long> localLookupNs_;
+    atomic<long long> localLookupMissCount_;
+    atomic<long long> localDispatchEnqueueCount_;
+    atomic<long long> localDispatchEnqueueNs_;
+    atomic<long long> localDispatchQueuedCount_;
+    atomic<long long> localDispatchInlineCount_;
+    atomic<long long> localDispatchDrainMsgCount_;
+    atomic<long long> localDispatchSendNs_;
+    atomic<long long> localDispatchQueueWaitNs_;
+    atomic<long long> localDispatchQueueWaitMaxNs_;
+    atomic<long long> localDispatchPeakQueueDepth_;
 };
 
 #endif /* CHATSERVICE_H */

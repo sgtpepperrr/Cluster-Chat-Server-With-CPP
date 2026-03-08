@@ -11,6 +11,23 @@
 using namespace muduo;
 using namespace std;
 
+namespace
+{
+long long nowSteadyNs()
+{
+    return chrono::duration_cast<chrono::nanoseconds>(
+        chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void updatePeak(atomic<long long>& peak, long long value)
+{
+    long long current = peak.load();
+    while (current < value && !peak.compare_exchange_weak(current, value))
+    {
+    }
+}
+}
+
 ChatService* ChatService::instance()
 {
     static ChatService service;
@@ -25,6 +42,25 @@ ChatService::ChatService()
     , remoteRouteFailCount_(0)
     , offlineFallbackCount_(0)
     , staleSessionCount_(0)
+    , oneChatSourceCount_(0)
+    , oneChatResolveCount_(0)
+    , oneChatResolveNs_(0)
+    , oneChatRemoteSendCount_(0)
+    , oneChatRemoteSendNs_(0)
+    , oneChatRemoteHandleCount_(0)
+    , oneChatRemoteHandleNs_(0)
+    , localLookupCount_(0)
+    , localLookupNs_(0)
+    , localLookupMissCount_(0)
+    , localDispatchEnqueueCount_(0)
+    , localDispatchEnqueueNs_(0)
+    , localDispatchQueuedCount_(0)
+    , localDispatchInlineCount_(0)
+    , localDispatchDrainMsgCount_(0)
+    , localDispatchSendNs_(0)
+    , localDispatchQueueWaitNs_(0)
+    , localDispatchQueueWaitMaxNs_(0)
+    , localDispatchPeakQueueDepth_(0)
 {
     loadEnvFile();
     int localQueueLimit = getEnvIntOrDefault("CHAT_LOCAL_DELIVERY_QUEUE_LIMIT", 8192);
@@ -296,6 +332,11 @@ void ChatService::clientCloseException(const TcpConnectionPtr& conn)
 
 void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time)
 {
+    (void)conn;
+    (void)time;
+
+    ++oneChatSourceCount_;
+
     int toId = js["to"].get<int>();
     int fromId = js["id"].get<int>();
     string msg = js.dump();
@@ -313,7 +354,12 @@ void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time
 
     // 第二步查控制面里的 userId -> nodeId。
     // Redis 在这里不再负责“转发消息”，只负责回答“目标用户属于哪个节点”。
-    if (nodeRegistry_ && nodeRegistry_->resolveUserNode(toId, nodeId, nodeMeta))
+    long long resolveStartNs = nowSteadyNs();
+    bool resolved = nodeRegistry_ && nodeRegistry_->resolveUserNode(toId, nodeId, nodeMeta);
+    oneChatResolveNs_.fetch_add(nowSteadyNs() - resolveStartNs);
+    ++oneChatResolveCount_;
+
+    if (resolved)
     {
         if (nodeRegistry_->isSelfNode(nodeId))
         {
@@ -333,8 +379,12 @@ void ChatService::oneChat(const TcpConnectionPtr& conn, json& js, Timestamp time
 
             // 已知目标用户属于远端节点后，直接走节点间 TCP 直连数据面。
             // 从“共享 Redis 转发”变成“已知地址后的定向直投”。
-            if (clusterRouter_ &&
-                clusterRouter_->sendOneChat(nodeMeta, selfNode_.nodeId, toId, msg, buildTraceId(fromId)))
+            long long remoteSendStartNs = nowSteadyNs();
+            bool sent = clusterRouter_ &&
+                clusterRouter_->sendOneChat(nodeMeta, selfNode_.nodeId, toId, msg, buildTraceId(fromId));
+            oneChatRemoteSendNs_.fetch_add(nowSteadyNs() - remoteSendStartNs);
+            ++oneChatRemoteSendCount_;
+            if (sent)
             {
                 ++remoteRouteCount_;
                 return;
@@ -370,11 +420,30 @@ void ChatService::reset()
         clusterRouter_->closeAll();
     }
 
+    auto avgUs = [](long long totalNs, long long count) -> long long {
+        return count > 0 ? totalNs / count / 1000 : 0;
+    };
+
     LOG_INFO << "cluster metrics local=" << localDeliveryCount_.load()
              << " remote=" << remoteRouteCount_.load()
              << " remote_fail=" << remoteRouteFailCount_.load()
              << " offline=" << offlineFallbackCount_.load()
              << " stale_session=" << staleSessionCount_.load();
+
+    LOG_INFO << "oneChat metrics"
+             << " source=" << oneChatSourceCount_.load()
+             << " resolve_avg_us=" << avgUs(oneChatResolveNs_.load(), oneChatResolveCount_.load())
+             << " remote_send_avg_us=" << avgUs(oneChatRemoteSendNs_.load(), oneChatRemoteSendCount_.load())
+             << " remote_handle_avg_us=" << avgUs(oneChatRemoteHandleNs_.load(), oneChatRemoteHandleCount_.load())
+             << " local_lookup_avg_us=" << avgUs(localLookupNs_.load(), localLookupCount_.load())
+             << " local_lookup_miss=" << localLookupMissCount_.load()
+             << " local_enqueue_avg_us=" << avgUs(localDispatchEnqueueNs_.load(), localDispatchEnqueueCount_.load())
+             << " local_queue_wait_avg_us=" << avgUs(localDispatchQueueWaitNs_.load(), localDispatchDrainMsgCount_.load())
+             << " local_queue_wait_max_us=" << (localDispatchQueueWaitMaxNs_.load() / 1000)
+             << " local_send_avg_us=" << avgUs(localDispatchSendNs_.load(), localDispatchDrainMsgCount_.load())
+             << " local_dispatch_inline=" << localDispatchInlineCount_.load()
+             << " local_dispatch_queued=" << localDispatchQueuedCount_.load()
+             << " local_dispatch_peak=" << localDispatchPeakQueueDepth_.load();
 
     if (nodeRegistry_)
     {
@@ -634,13 +703,22 @@ void ChatService::drainLocalDeliveriesInLoop(const shared_ptr<LocalLoopDispatche
         {
             LocalDeliveryTask task = tasks.front();
             tasks.pop_front();
+
+            long long drainStartNs = nowSteadyNs();
+            long long queueWaitNs = drainStartNs - task.enqueueNs;
+            localDispatchQueueWaitNs_.fetch_add(queueWaitNs);
+            updatePeak(localDispatchQueueWaitMaxNs_, queueWaitNs);
+
             task.conn->send(task.msg);
+            localDispatchSendNs_.fetch_add(nowSteadyNs() - drainStartNs);
+            ++localDispatchDrainMsgCount_;
         }
     }
 }
 
 bool ChatService::enqueueLocalDelivery(const TcpConnectionPtr& conn, const string& msg)
 {
+    long long enqueueStartNs = nowSteadyNs();
     shared_ptr<LocalLoopDispatcher> dispatcher = getOrCreateLocalDispatcher(conn->getLoop());
     bool shouldSchedule = false;
 
@@ -653,7 +731,8 @@ bool ChatService::enqueueLocalDelivery(const TcpConnectionPtr& conn, const strin
             return false;
         }
 
-        dispatcher->pending.push_back(LocalDeliveryTask{conn, msg});
+        dispatcher->pending.push_back(LocalDeliveryTask{conn, msg, nowSteadyNs()});
+        updatePeak(localDispatchPeakQueueDepth_, static_cast<long long>(dispatcher->pending.size()));
         if (!dispatcher->flushScheduled)
         {
             dispatcher->flushScheduled = true;
@@ -661,14 +740,19 @@ bool ChatService::enqueueLocalDelivery(const TcpConnectionPtr& conn, const strin
         }
     }
 
+    localDispatchEnqueueNs_.fetch_add(nowSteadyNs() - enqueueStartNs);
+    ++localDispatchEnqueueCount_;
+
     if (shouldSchedule)
     {
         if (dispatcher->loop->isInLoopThread())
         {
+            ++localDispatchInlineCount_;
             drainLocalDeliveriesInLoop(dispatcher);
         }
         else
         {
+            ++localDispatchQueuedCount_;
             dispatcher->loop->queueInLoop([this, dispatcher]() {
                 drainLocalDeliveriesInLoop(dispatcher);
             });
@@ -680,9 +764,13 @@ bool ChatService::enqueueLocalDelivery(const TcpConnectionPtr& conn, const strin
 
 bool ChatService::deliverToLocalUser(int userId, const string& msg)
 {
+    long long lookupStartNs = nowSteadyNs();
     TcpConnectionPtr conn = getLocalConnection(userId);
+    localLookupNs_.fetch_add(nowSteadyNs() - lookupStartNs);
+    ++localLookupCount_;
     if (!conn)
     {
+        ++localLookupMissCount_;
         return false;
     }
 
@@ -707,11 +795,17 @@ void ChatService::handleClusterOneChat(json& js)
 
 void ChatService::handleClusterOneChatFrame(int toUser, const string& payload)
 {
+    long long remoteHandleStartNs = nowSteadyNs();
     if (deliverToLocalUser(toUser, payload))
     {
+        ++oneChatRemoteHandleCount_;
+        oneChatRemoteHandleNs_.fetch_add(nowSteadyNs() - remoteHandleStartNs);
         ++localDeliveryCount_;
         return;
     }
+
+    ++oneChatRemoteHandleCount_;
+    oneChatRemoteHandleNs_.fetch_add(nowSteadyNs() - remoteHandleStartNs);
 
     if (nodeRegistry_)
     {

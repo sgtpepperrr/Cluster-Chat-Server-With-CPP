@@ -1,5 +1,6 @@
 #include "chatserver.hpp"
 #include "chatservice.hpp"
+#include "config.hpp"
 #include "json.hpp"
 #include <muduo/base/Logging.h>
 #include <functional>
@@ -21,8 +22,16 @@ ChatServer::ChatServer(EventLoop* loop,
     // 给服务器注册用户读写事件的回调
     server_.setMessageCallback(std::bind(&ChatServer::onMessage, this, _1, _2, _3));
 
-    // 设置服务器端的线程数量
-    server_.setThreadNum(4);
+    // 客户端入口的 worker 线程数做成配置项。
+    // 为什么要这样做：前面的指标已经表明，oneChat 的主要等待时间落在“目标客户端连接所属 loop 的排队”上。
+    // 因此这里需要能单独调节 client-facing I/O 线程，而不是把瓶颈继续归咎于 ClusterRouter。
+    loadEnvFile();
+    int ioThreads = getEnvIntOrDefault("CHAT_SERVER_IO_THREADS", 4);
+    if (ioThreads <= 0)
+    {
+        ioThreads = 4;
+    }
+    server_.setThreadNum(ioThreads);
 }
 
 void ChatServer::start()

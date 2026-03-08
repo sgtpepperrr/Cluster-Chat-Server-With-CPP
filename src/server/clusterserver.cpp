@@ -1,5 +1,6 @@
 #include "clusterserver.hpp"
 #include "chatservice.hpp"
+#include "config.hpp"
 #include "json.hpp"
 
 #include <muduo/base/Logging.h>
@@ -38,7 +39,16 @@ ClusterServer::ClusterServer(EventLoop* loop,
 {
     server_.setConnectionCallback(std::bind(&ClusterServer::onConnection, this, _1));
     server_.setMessageCallback(std::bind(&ClusterServer::onMessage, this, _1, _2, _3));
-    server_.setThreadNum(4);
+
+    // 集群收件口线程数也做成配置项，但它的优先级低于客户端入口。
+    // 这样可以把“客户端入口线程不足”和“内部收件线程不足”区分开来做压测。
+    loadEnvFile();
+    int ioThreads = getEnvIntOrDefault("CHAT_CLUSTER_IO_THREADS", 4);
+    if (ioThreads <= 0)
+    {
+        ioThreads = 4;
+    }
+    server_.setThreadNum(ioThreads);
 }
 
 void ClusterServer::start()

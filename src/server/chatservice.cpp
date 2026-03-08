@@ -18,12 +18,18 @@ ChatService* ChatService::instance()
 }
 
 ChatService::ChatService()
-    : localDeliveryCount_(0)
+    : connBucketCount_(64)
+    , localDeliveryCount_(0)
     , remoteRouteCount_(0)
     , remoteRouteFailCount_(0)
     , offlineFallbackCount_(0)
     , staleSessionCount_(0)
 {
+    for (size_t i = 0; i < connBucketCount_; ++i)
+    {
+        connBuckets_.push_back(unique_ptr<ConnectionBucket>(new ConnectionBucket()));
+    }
+
     msgHandlerMap_.insert({LOGIN_MSG, std::bind(&ChatService::login, this, _1, _2, _3)});
     msgHandlerMap_.insert({LOGOUT_MSG, std::bind(&ChatService::logout, this, _1, _2, _3)});
     msgHandlerMap_.insert({REG_MSG, std::bind(&ChatService::reg, this, _1, _2, _3)});
@@ -127,18 +133,14 @@ void ChatService::login(const TcpConnectionPtr& conn, json& js, Timestamp time)
                 ++staleSessionCount_;
             }
 
-            {
-                lock_guard<mutex> lock(connMutex_);
-                userConnMap_.insert({id, conn});
-            }
+            addLocalConnection(id, conn);
 
             // 登录成功后，把用户归属写入控制面：userId -> nodeId。
             // 为什么要这样做：后续别的节点给该用户发消息时，
             // 第一件事就是查“这个用户现在在哪个节点”。
             if (nodeRegistry_ && !nodeRegistry_->bindUser(id))
             {
-                lock_guard<mutex> lock(connMutex_);
-                userConnMap_.erase(id);
+                removeLocalConnection(id);
 
                 json resp;
                 resp["msgId"] = LOGIN_MSG_ACK;
@@ -254,14 +256,7 @@ void ChatService::logout(const TcpConnectionPtr& conn, json& js, Timestamp time)
 {
     int userid = js["id"].get<int>();
 
-    {
-        lock_guard<mutex> lock(connMutex_);
-        auto it = userConnMap_.find(userid);
-        if (it != userConnMap_.end())
-        {
-            userConnMap_.erase(it);
-        }
-    }
+    removeLocalConnection(userid);
 
     if (nodeRegistry_)
     {
@@ -277,19 +272,7 @@ void ChatService::clientCloseException(const TcpConnectionPtr& conn)
 {
     User user;
 
-    {
-        lock_guard<mutex> lock(connMutex_);
-
-        for (auto it = userConnMap_.begin(); it != userConnMap_.end(); ++it)
-        {
-            if (it->second == conn)
-            {
-                user.setId(it->first);
-                userConnMap_.erase(it);
-                break;
-            }
-        }
-    }
+    user.setId(removeLocalConnectionByConn(conn));
 
     if (user.getId() != -1)
     {
@@ -444,24 +427,21 @@ void ChatService::groupChat(const TcpConnectionPtr& conn, json& js, Timestamp ti
     localConns.reserve(userIdVec.size());
     unresolvedIds.reserve(userIdVec.size());
 
+    for (int id : userIdVec)
     {
-        lock_guard<mutex> lock(connMutex_);
-        for (int id : userIdVec)
+        TcpConnectionPtr localConn = getLocalConnection(id);
+        if (localConn)
         {
-            auto it = userConnMap_.find(id);
-            if (it != userConnMap_.end())
-            {
-                localConns.push_back(it->second);
-            }
-            else
-            {
-                unresolvedIds.push_back(id);
-            }
+            localConns.push_back(localConn);
+        }
+        else
+        {
+            unresolvedIds.push_back(id);
         }
     }
 
     // 对不在本地连接表中的用户，再去控制面查归属。
-    // 这里要先释放 connMutex_，避免把“本地连接表锁”扩展成包含 Redis 查询的长临界区。
+    // 现在连接表已经分片，不再有“一把全局锁包住整段扫描”的问题。
     for (int id : unresolvedIds)
     {
         string nodeId;
@@ -553,11 +533,56 @@ void ChatService::handleClusterMessage(json& js)
     LOG_ERROR << "unknown cluster msgId: " << msgId;
 }
 
+size_t ChatService::pickConnBucket(int userId) const
+{
+    if (connBucketCount_ == 0)
+    {
+        return 0;
+    }
+
+    return static_cast<size_t>(userId >= 0 ? userId : -userId) % connBucketCount_;
+}
+
+void ChatService::addLocalConnection(int userId, const TcpConnectionPtr& conn)
+{
+    ConnectionBucket* bucket = connBuckets_[pickConnBucket(userId)].get();
+    lock_guard<mutex> lock(bucket->bucketMutex);
+    bucket->userConnMap[userId] = conn;
+}
+
+void ChatService::removeLocalConnection(int userId)
+{
+    ConnectionBucket* bucket = connBuckets_[pickConnBucket(userId)].get();
+    lock_guard<mutex> lock(bucket->bucketMutex);
+    bucket->userConnMap.erase(userId);
+}
+
+int ChatService::removeLocalConnectionByConn(const TcpConnectionPtr& conn)
+{
+    for (size_t i = 0; i < connBuckets_.size(); ++i)
+    {
+        ConnectionBucket* bucket = connBuckets_[i].get();
+        lock_guard<mutex> lock(bucket->bucketMutex);
+        for (auto it = bucket->userConnMap.begin(); it != bucket->userConnMap.end(); ++it)
+        {
+            if (it->second == conn)
+            {
+                int userId = it->first;
+                bucket->userConnMap.erase(it);
+                return userId;
+            }
+        }
+    }
+
+    return -1;
+}
+
 TcpConnectionPtr ChatService::getLocalConnection(int userId)
 {
-    lock_guard<mutex> lock(connMutex_);
-    auto it = userConnMap_.find(userId);
-    if (it == userConnMap_.end())
+    ConnectionBucket* bucket = connBuckets_[pickConnBucket(userId)].get();
+    lock_guard<mutex> lock(bucket->bucketMutex);
+    auto it = bucket->userConnMap.find(userId);
+    if (it == bucket->userConnMap.end())
     {
         return TcpConnectionPtr();
     }

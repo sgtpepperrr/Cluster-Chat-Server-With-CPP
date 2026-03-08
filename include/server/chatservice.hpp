@@ -6,6 +6,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <vector>
 #include <muduo/net/EventLoop.h>
 #include <muduo/net/TcpConnection.h>
 #include "json.hpp"
@@ -62,8 +63,18 @@ public:
     void handleClusterOneChatFrame(int toUser, const string& payload);
 
 private:
+    struct ConnectionBucket
+    {
+        unordered_map<int, TcpConnectionPtr> userConnMap;
+        mutex bucketMutex;
+    };
+
     ChatService();
 
+    size_t pickConnBucket(int userId) const;
+    void addLocalConnection(int userId, const TcpConnectionPtr& conn);
+    void removeLocalConnection(int userId);
+    int removeLocalConnectionByConn(const TcpConnectionPtr& conn);
     TcpConnectionPtr getLocalConnection(int userId);
     bool deliverToLocalUser(int userId, const string& msg);
     string buildTraceId(int fromUserId) const;
@@ -72,10 +83,9 @@ private:
 
     unordered_map<int, MsgHandler> msgHandlerMap_;
 
-    // 存储在线用户的通信连接
-    unordered_map<int, TcpConnectionPtr> userConnMap_;
-
-    mutex connMutex_;
+    // 在线连接表按 userId 分片，避免所有本地投递都抢同一把全局锁。
+    vector<unique_ptr<ConnectionBucket> > connBuckets_;
+    size_t connBucketCount_;
 
     UserModel userModel_;
 

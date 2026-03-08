@@ -79,6 +79,7 @@ private:
     bool enqueueOrSend(const std::shared_ptr<ShardChannel>& channel,
                        const std::string& message);
     void scheduleConnect(const std::shared_ptr<ShardChannel>& channel);
+    void drainPendingInLoop(const std::shared_ptr<ShardChannel>& channel);
     void handleConnection(const std::shared_ptr<ShardChannel>& channel,
                           const muduo::net::TcpConnectionPtr& conn);
     void handleWriteComplete(const std::shared_ptr<ShardChannel>& channel,

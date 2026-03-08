@@ -287,16 +287,23 @@ bool ClusterRouter::enqueueOrSend(const shared_ptr<ShardChannel>& channel,
                                   const string& message)
 {
     bool shouldConnect = false;
+    bool shouldDrain = false;
     TcpConnectionPtr connection;
 
     {
         lock_guard<mutex> lock(channel->mutex);
-        if (channel->closing || channel->overloaded)
+        if (channel->closing)
         {
             return false;
         }
 
-        if (channel->connection && channel->connection->connected())
+        bool connected = channel->connection && channel->connection->connected();
+
+        // 热路径只在“已连接、未背压、没有历史积压”时直接 send。
+        // 一旦连接正在背压，或者已经有排队消息，就统一先进 pending，避免：
+        // 1) 临时 high-water 时直接丢消息
+        // 2) 新消息绕过旧消息，破坏同 shard 内发送顺序
+        if (connected && !channel->overloaded && channel->pending.empty())
         {
             connection = channel->connection;
         }
@@ -304,22 +311,26 @@ bool ClusterRouter::enqueueOrSend(const shared_ptr<ShardChannel>& channel,
         {
             if (channel->pending.size() >= channel->pendingLimit)
             {
+                LOG_WARN << "cluster channel pending queue full channel=" << channel->channelId
+                         << " size=" << channel->pending.size();
                 return false;
             }
 
             channel->pending.push_back(message);
-            if (!channel->connecting)
+            if (!connected && !channel->connecting)
             {
                 channel->connecting = true;
                 shouldConnect = true;
+            }
+            else if (connected && !channel->overloaded)
+            {
+                shouldDrain = true;
             }
         }
     }
 
     if (connection)
     {
-        // 连接已经热起来时，热路径直接把消息交给 Muduo。
-        // 这里不再额外进入我们自己那套 batch 队列，避免再次引入抖动。
         connection->send(message);
         return true;
     }
@@ -327,6 +338,12 @@ bool ClusterRouter::enqueueOrSend(const shared_ptr<ShardChannel>& channel,
     if (shouldConnect)
     {
         scheduleConnect(channel);
+    }
+    else if (shouldDrain)
+    {
+        channel->ioLoop->queueInLoop([this, channel]() {
+            drainPendingInLoop(channel);
+        });
     }
 
     return true;
@@ -356,6 +373,41 @@ void ClusterRouter::scheduleConnect(const shared_ptr<ShardChannel>& channel)
     });
 }
 
+void ClusterRouter::drainPendingInLoop(const shared_ptr<ShardChannel>& channel)
+{
+    channel->ioLoop->assertInLoopThread();
+
+    while (true)
+    {
+        TcpConnectionPtr connection;
+        string message;
+
+        {
+            lock_guard<mutex> lock(channel->mutex);
+            if (channel->closing || channel->overloaded)
+            {
+                return;
+            }
+
+            if (!(channel->connection && channel->connection->connected()))
+            {
+                return;
+            }
+
+            if (channel->pending.empty())
+            {
+                return;
+            }
+
+            connection = channel->connection;
+            message.swap(channel->pending.front());
+            channel->pending.pop_front();
+        }
+
+        connection->send(message);
+    }
+}
+
 void ClusterRouter::handleConnection(const shared_ptr<ShardChannel>& channel,
                                      const TcpConnectionPtr& conn)
 {
@@ -370,21 +422,15 @@ void ClusterRouter::handleConnection(const shared_ptr<ShardChannel>& channel,
                       std::placeholders::_2),
             channel->highWaterMark);
 
-        deque<string> pending;
         {
             lock_guard<mutex> lock(channel->mutex);
             channel->connection = conn;
             channel->connecting = false;
             channel->overloaded = false;
-            pending.swap(channel->pending);
         }
 
-        while (!pending.empty())
-        {
-            conn->send(pending.front());
-            pending.pop_front();
-        }
-
+        // 建连成功后，继续发送“建连期间”和“背压期间”暂存在 pending 里的消息。
+        drainPendingInLoop(channel);
         return;
     }
 
@@ -401,8 +447,13 @@ void ClusterRouter::handleWriteComplete(const shared_ptr<ShardChannel>& channel,
 {
     (void)conn;
 
-    lock_guard<mutex> lock(channel->mutex);
-    channel->overloaded = false;
+    {
+        lock_guard<mutex> lock(channel->mutex);
+        channel->overloaded = false;
+    }
+
+    // 输出缓冲回落后，继续把背压期间积压的小队列往前推。
+    drainPendingInLoop(channel);
 }
 
 void ClusterRouter::handleHighWaterMark(const shared_ptr<ShardChannel>& channel,

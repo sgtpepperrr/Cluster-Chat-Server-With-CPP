@@ -5,10 +5,30 @@
 #include <muduo/base/Logging.h>
 #include <functional>
 #include <string>
+#include <cstdint>
 
 using namespace std;
 using namespace placeholders;
 using json = nlohmann::json;
+
+namespace
+{
+// 收件端同时兼容两种内部协议：
+// 1) oneChat 轻量帧 ONC1
+// 2) 旧的 JSON\0（当前 groupChat 仍走这条路径）
+const char kOneChatFrameMagic[] = {'O', 'N', 'C', '1'};
+const size_t kOneChatFrameMagicBytes = sizeof(kOneChatFrameMagic);
+const size_t kOneChatFrameHeaderBytes = 8;
+const size_t kOneChatFrameBodyPrefixBytes = 4;
+
+uint32_t readUint32(const char* data)
+{
+    return (static_cast<uint32_t>(static_cast<unsigned char>(data[0])) << 24) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(data[1])) << 16) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(data[2])) << 8) |
+           static_cast<uint32_t>(static_cast<unsigned char>(data[3]));
+}
+}
 
 ClusterServer::ClusterServer(EventLoop* loop,
                              const InetAddress& listenAddr,
@@ -30,8 +50,6 @@ void ClusterServer::onConnection(const TcpConnectionPtr& conn)
 {
     if (conn->connected())
     {
-        // TCP 是字节流，不保证一次 onMessage 就是一条完整 JSON。
-        // 因此每条内部连接都要挂一个“残留字节缓冲区”，把半包攒起来。
         conn->setContext(string());
         return;
     }
@@ -56,24 +74,63 @@ void ClusterServer::onMessage(const TcpConnectionPtr& conn, Buffer* buffer, Time
         pending = boost::any_cast<string>(conn->getMutableContext());
     }
 
-    // 内部协议仍旧使用 '\0' 作为分隔符，但现在按“流式字节缓冲”处理：
-    // 先把本次读到的字节追加到连接级缓存里，再只解析完整帧，把半包留到下次。
     pending->append(buffer->retrieveAllAsString());
 
-    size_t start = 0;
-    while (true)
+    while (!pending->empty())
     {
-        size_t end = pending->find('\0', start);
+        if (pending->front() == kOneChatFrameMagic[0])
+        {
+            if (pending->size() < kOneChatFrameMagicBytes)
+            {
+                break;
+            }
+
+            if (pending->compare(0, kOneChatFrameMagicBytes, kOneChatFrameMagic, kOneChatFrameMagicBytes) == 0)
+            {
+                if (pending->size() < kOneChatFrameMagicBytes + kOneChatFrameHeaderBytes)
+                {
+                    break;
+                }
+
+                uint32_t bodyLen = readUint32(pending->data() + kOneChatFrameMagicBytes);
+                if (bodyLen < kOneChatFrameBodyPrefixBytes)
+                {
+                    LOG_ERROR << "cluster oneChat frame body too short: " << bodyLen;
+                    pending->clear();
+                    break;
+                }
+
+                size_t frameLen = kOneChatFrameMagicBytes + kOneChatFrameHeaderBytes + bodyLen - kOneChatFrameBodyPrefixBytes;
+                if (pending->size() < frameLen)
+                {
+                    break;
+                }
+
+                int toUser = static_cast<int>(readUint32(pending->data() + kOneChatFrameMagicBytes + 4));
+                string payload = pending->substr(kOneChatFrameMagicBytes + kOneChatFrameHeaderBytes,
+                                                 bodyLen - kOneChatFrameBodyPrefixBytes);
+                ChatService::instance()->handleClusterOneChatFrame(toUser, payload);
+                pending->erase(0, frameLen);
+                continue;
+            }
+
+            LOG_ERROR << "cluster unknown oneChat frame magic";
+            pending->clear();
+            break;
+        }
+
+        // 不是 ONC1 帧时，就按旧的 JSON\0 路径处理。
+        size_t end = pending->find('\0');
         if (end == string::npos)
         {
             break;
         }
 
-        if (end > start)
+        if (end > 0)
         {
             try
             {
-                json js = json::parse(pending->begin() + start, pending->begin() + end);
+                json js = json::parse(pending->begin(), pending->begin() + end);
                 ChatService::instance()->handleClusterMessage(js);
             }
             catch (const json::exception& e)
@@ -82,11 +139,6 @@ void ClusterServer::onMessage(const TcpConnectionPtr& conn, Buffer* buffer, Time
             }
         }
 
-        start = end + 1;
-    }
-
-    if (start > 0)
-    {
-        pending->erase(0, start);
+        pending->erase(0, end + 1);
     }
 }

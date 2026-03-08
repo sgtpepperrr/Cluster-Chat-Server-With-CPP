@@ -590,6 +590,11 @@ void ChatService::handleClusterOneChat(json& js)
 {
     int toUser = js["toUser"].get<int>();
     string payload = js["payload"];
+    handleClusterOneChatFrame(toUser, payload);
+}
+
+void ChatService::handleClusterOneChatFrame(int toUser, const string& payload)
+{
     if (deliverToLocalUser(toUser, payload))
     {
         ++localDeliveryCount_;

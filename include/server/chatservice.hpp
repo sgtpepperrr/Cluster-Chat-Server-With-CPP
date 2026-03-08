@@ -59,6 +59,7 @@ public:
     void handleRedisSubscribeMessage(int, string);
 
     void handleClusterMessage(json& js);
+    void handleClusterOneChatFrame(int toUser, const string& payload);
 
 private:
     ChatService();

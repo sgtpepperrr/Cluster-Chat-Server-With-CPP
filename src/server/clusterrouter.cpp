@@ -5,11 +5,29 @@
 
 #include <muduo/base/Logging.h>
 #include <functional>
+#include <cstdint>
 
 using namespace std;
 using namespace muduo;
 using namespace muduo::net;
 using json = nlohmann::json;
+
+namespace
+{
+// oneChat 走轻量内部帧：magic(4) + bodyLen(4) + toUser(4) + payload。
+// 这样目标节点收到后不需要先解一层外部 JSON，再去取真正的聊天 JSON。
+const char kOneChatFrameMagic[] = {'O', 'N', 'C', '1'};
+const size_t kOneChatFrameHeaderBytes = 8;
+const size_t kOneChatFrameBodyPrefixBytes = 4;
+
+void appendUint32(string& out, uint32_t value)
+{
+    out.push_back(static_cast<char>((value >> 24) & 0xFF));
+    out.push_back(static_cast<char>((value >> 16) & 0xFF));
+    out.push_back(static_cast<char>((value >> 8) & 0xFF));
+    out.push_back(static_cast<char>(value & 0xFF));
+}
+}
 
 ClusterRouter::ClusterRouter(EventLoop* baseLoop)
     : baseLoop_(baseLoop)
@@ -55,17 +73,12 @@ ClusterRouter::ClusterRouter(EventLoop* baseLoop)
     }
     ioThreadCount_ = ioThreads;
 
-    // 现在恢复为多 inter-node loops：
     // 不同 nodeId#shard 会落到不同 I/O 线程上，减少单 loop 串行排队。
-    // 但 TcpClient 的创建/连接/销毁仍然严格在所属 loop 线程内执行，
-    // 保留前一轮修好的线程归属边界。
+    // 但 TcpClient 的创建/连接/销毁仍然严格在所属 loop 线程内执行。
     ioThreadPool_.reset(new EventLoopThreadPool(baseLoop_, "ClusterRouterIO"));
     ioThreadPool_->setThreadNum(ioThreadCount_);
     ioThreadPool_->start();
 
-    // 注意：EventLoopThreadPool 的取 loop 接口属于 Muduo 内部线程模型的一部分，
-    // 不能在任意业务线程里随便调用，否则可能再次碰到 baseLoop 的线程约束。
-    // 因此这里只在构造阶段（主线程）把所有 inter-node loops 取出来，后面热路径只做纯数组寻址。
     ioLoops_ = ioThreadPool_->getAllLoops();
     if (ioLoops_.empty())
     {
@@ -84,19 +97,24 @@ bool ClusterRouter::sendOneChat(const NodeMeta& nodeMeta,
                                 const string& payload,
                                 const string& traceId)
 {
+    (void)fromNode;
+    (void)traceId;
+
     if (!nodeMeta.valid())
     {
         return false;
     }
 
-    json js;
-    js["msgId"] = NODE_ROUTE_ONE_CHAT_MSG;
-    js["fromNode"] = fromNode;
-    js["toNode"] = nodeMeta.nodeId;
-    js["toUser"] = toUser;
-    js["payload"] = payload;
-    js["traceId"] = traceId;
-    return sendInternalMessage(nodeMeta, pickShard(toUser), js.dump() + '\0');
+    // 只给 oneChat 做轻量帧优化；payload 仍然保持原始客户端消息 JSON。
+    // 也就是说：我们减少的是‘节点间封装成本’，不是改客户端协议。
+    string frame;
+    frame.reserve(sizeof(kOneChatFrameMagic) + kOneChatFrameHeaderBytes + payload.size());
+    frame.append(kOneChatFrameMagic, sizeof(kOneChatFrameMagic));
+    appendUint32(frame, static_cast<uint32_t>(kOneChatFrameBodyPrefixBytes + payload.size()));
+    appendUint32(frame, static_cast<uint32_t>(toUser));
+    frame.append(payload);
+
+    return sendInternalMessage(nodeMeta, pickShard(toUser), frame);
 }
 
 bool ClusterRouter::sendGroupChat(const NodeMeta& nodeMeta,
@@ -144,8 +162,6 @@ void ClusterRouter::prewarmNode(const NodeMeta& nodeMeta)
         warmedNodeInstances_[nodeMeta.nodeId] = nodeMeta.instanceId;
     }
 
-    // 预热的目标不是发送业务消息，而是把“首次跨节点消息的建连成本”提前支付掉。
-    // 关键点是：每个远端节点实例只预热一次，不能在 oneChat 热路径里反复扫所有 shard。
     for (size_t shardIndex = 0; shardIndex < shardCount_; ++shardIndex)
     {
         shared_ptr<ShardChannel> channel = getOrCreateChannel(nodeMeta, shardIndex);
@@ -258,9 +274,6 @@ void ClusterRouter::ensureClientInLoop(const shared_ptr<ShardChannel>& channel)
         return;
     }
 
-    // TcpClient 绑定哪个 EventLoop，就必须在哪个 EventLoop 线程里创建。
-    // 上一版在 ChatServer 的 worker 线程里直接 new TcpClient，
-    // 会触发 Muduo 的 abortNotInLoopThread。
     InetAddress serverAddr(channel->nodeMeta.interIp, channel->nodeMeta.interPort);
     channel->client.reset(new TcpClient(channel->ioLoop, serverAddr, channel->channelId));
     channel->client->enableRetry();
@@ -273,13 +286,8 @@ void ClusterRouter::ensureClientInLoop(const shared_ptr<ShardChannel>& channel)
 bool ClusterRouter::enqueueOrSend(const shared_ptr<ShardChannel>& channel,
                                   const string& message)
 {
-    TcpConnectionPtr connection;
     bool shouldConnect = false;
-
-    // 热路径优先做两件事：
-    // 1) 已连上时直接交给 Muduo 连接发送
-    // 2) 未连上时只做一个很小的瞬时缓冲，然后触发异步 connect
-    // 这样业务线程不会再像旧实现那样，被 worker + 阻塞 write 串住。
+    TcpConnectionPtr connection;
 
     {
         lock_guard<mutex> lock(channel->mutex);
@@ -310,6 +318,8 @@ bool ClusterRouter::enqueueOrSend(const shared_ptr<ShardChannel>& channel,
 
     if (connection)
     {
+        // 连接已经热起来时，热路径直接把消息交给 Muduo。
+        // 这里不再额外进入我们自己那套 batch 队列，避免再次引入抖动。
         connection->send(message);
         return true;
     }
@@ -360,8 +370,6 @@ void ClusterRouter::handleConnection(const shared_ptr<ShardChannel>& channel,
                       std::placeholders::_2),
             channel->highWaterMark);
 
-        // 连接建立成功后，把“建连期间短暂攒下来的消息”一次性交给 Muduo。
-        // 注意这里仍然不是手写 worker 队列，而只是 connect-gap 的瞬时缓冲。
         deque<string> pending;
         {
             lock_guard<mutex> lock(channel->mutex);
@@ -392,6 +400,7 @@ void ClusterRouter::handleWriteComplete(const shared_ptr<ShardChannel>& channel,
                                         const TcpConnectionPtr& conn)
 {
     (void)conn;
+
     lock_guard<mutex> lock(channel->mutex);
     channel->overloaded = false;
 }
@@ -415,7 +424,6 @@ void ClusterRouter::stopChannel(const shared_ptr<ShardChannel>& channel)
     TcpConnectionPtr connection;
     {
         lock_guard<mutex> lock(channel->mutex);
-        // closeAll/节点下线时直接清空瞬时缓冲，避免旧连接上的残留消息继续外发。
         channel->closing = true;
         channel->connecting = false;
         channel->pending.clear();

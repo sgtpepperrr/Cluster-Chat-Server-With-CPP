@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <vector>
+#include <deque>
 #include <muduo/net/EventLoop.h>
 #include <muduo/net/TcpConnection.h>
 #include "json.hpp"
@@ -69,6 +70,28 @@ private:
         mutex bucketMutex;
     };
 
+    struct LocalDeliveryTask
+    {
+        TcpConnectionPtr conn;
+        string msg;
+    };
+
+    struct LocalLoopDispatcher
+    {
+        LocalLoopDispatcher(EventLoop* ownerLoop, size_t limit)
+            : loop(ownerLoop)
+            , flushScheduled(false)
+            , pendingLimit(limit)
+        {
+        }
+
+        EventLoop* loop;
+        deque<LocalDeliveryTask> pending;
+        bool flushScheduled;
+        size_t pendingLimit;
+        mutex pendingMutex;
+    };
+
     ChatService();
 
     size_t pickConnBucket(int userId) const;
@@ -76,6 +99,9 @@ private:
     void removeLocalConnection(int userId);
     int removeLocalConnectionByConn(const TcpConnectionPtr& conn);
     TcpConnectionPtr getLocalConnection(int userId);
+    shared_ptr<LocalLoopDispatcher> getOrCreateLocalDispatcher(EventLoop* loop);
+    void drainLocalDeliveriesInLoop(const shared_ptr<LocalLoopDispatcher>& dispatcher);
+    bool enqueueLocalDelivery(const TcpConnectionPtr& conn, const string& msg);
     bool deliverToLocalUser(int userId, const string& msg);
     string buildTraceId(int fromUserId) const;
     void handleClusterOneChat(json& js);
@@ -86,6 +112,11 @@ private:
     // 在线连接表按 userId 分片，避免所有本地投递都抢同一把全局锁。
     vector<unique_ptr<ConnectionBucket> > connBuckets_;
     size_t connBucketCount_;
+
+    // 本地消息按“目标连接所属 EventLoop”分桶，减少每条消息单独跨线程调度。
+    mutex localDispatchersMutex_;
+    unordered_map<EventLoop*, shared_ptr<LocalLoopDispatcher> > localDispatchers_;
+    size_t localDeliveryQueueLimit_;
 
     UserModel userModel_;
 

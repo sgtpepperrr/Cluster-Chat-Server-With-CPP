@@ -19,12 +19,20 @@ ChatService* ChatService::instance()
 
 ChatService::ChatService()
     : connBucketCount_(64)
+    , localDeliveryQueueLimit_(8192)
     , localDeliveryCount_(0)
     , remoteRouteCount_(0)
     , remoteRouteFailCount_(0)
     , offlineFallbackCount_(0)
     , staleSessionCount_(0)
 {
+    loadEnvFile();
+    int localQueueLimit = getEnvIntOrDefault("CHAT_LOCAL_DELIVERY_QUEUE_LIMIT", 8192);
+    if (localQueueLimit > 0)
+    {
+        localDeliveryQueueLimit_ = static_cast<size_t>(localQueueLimit);
+    }
+
     for (size_t i = 0; i < connBucketCount_; ++i)
     {
         connBuckets_.push_back(unique_ptr<ConnectionBucket>(new ConnectionBucket()));
@@ -590,6 +598,86 @@ TcpConnectionPtr ChatService::getLocalConnection(int userId)
     return it->second;
 }
 
+shared_ptr<ChatService::LocalLoopDispatcher> ChatService::getOrCreateLocalDispatcher(EventLoop* loop)
+{
+    lock_guard<mutex> lock(localDispatchersMutex_);
+    auto it = localDispatchers_.find(loop);
+    if (it != localDispatchers_.end())
+    {
+        return it->second;
+    }
+
+    shared_ptr<LocalLoopDispatcher> dispatcher(new LocalLoopDispatcher(loop, localDeliveryQueueLimit_));
+    localDispatchers_[loop] = dispatcher;
+    return dispatcher;
+}
+
+void ChatService::drainLocalDeliveriesInLoop(const shared_ptr<LocalLoopDispatcher>& dispatcher)
+{
+    dispatcher->loop->assertInLoopThread();
+
+    while (true)
+    {
+        deque<LocalDeliveryTask> tasks;
+        {
+            lock_guard<mutex> lock(dispatcher->pendingMutex);
+            if (dispatcher->pending.empty())
+            {
+                dispatcher->flushScheduled = false;
+                return;
+            }
+
+            tasks.swap(dispatcher->pending);
+        }
+
+        while (!tasks.empty())
+        {
+            LocalDeliveryTask task = tasks.front();
+            tasks.pop_front();
+            task.conn->send(task.msg);
+        }
+    }
+}
+
+bool ChatService::enqueueLocalDelivery(const TcpConnectionPtr& conn, const string& msg)
+{
+    shared_ptr<LocalLoopDispatcher> dispatcher = getOrCreateLocalDispatcher(conn->getLoop());
+    bool shouldSchedule = false;
+
+    {
+        lock_guard<mutex> lock(dispatcher->pendingMutex);
+        if (dispatcher->pending.size() >= dispatcher->pendingLimit)
+        {
+            LOG_WARN << "local delivery queue full loop=" << conn->getLoop()
+                     << " size=" << dispatcher->pending.size();
+            return false;
+        }
+
+        dispatcher->pending.push_back(LocalDeliveryTask{conn, msg});
+        if (!dispatcher->flushScheduled)
+        {
+            dispatcher->flushScheduled = true;
+            shouldSchedule = true;
+        }
+    }
+
+    if (shouldSchedule)
+    {
+        if (dispatcher->loop->isInLoopThread())
+        {
+            drainLocalDeliveriesInLoop(dispatcher);
+        }
+        else
+        {
+            dispatcher->loop->queueInLoop([this, dispatcher]() {
+                drainLocalDeliveriesInLoop(dispatcher);
+            });
+        }
+    }
+
+    return true;
+}
+
 bool ChatService::deliverToLocalUser(int userId, const string& msg)
 {
     TcpConnectionPtr conn = getLocalConnection(userId);
@@ -598,8 +686,7 @@ bool ChatService::deliverToLocalUser(int userId, const string& msg)
         return false;
     }
 
-    conn->send(msg);
-    return true;
+    return enqueueLocalDelivery(conn, msg);
 }
 
 string ChatService::buildTraceId(int fromUserId) const
